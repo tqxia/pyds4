@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyds4"
+version = "0.0.1"
+description = "Educational PyTorch + Triton re-implementation of antirez/ds4 (DeepSeek V4 Flash)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    # torch + triton are imported lazily by later milestones; not required for M1.
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["pyds4*"]
