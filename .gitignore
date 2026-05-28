@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+# Compiled oracle binaries (scripts/*.c → scripts/<name>)
+scripts/q8_0_oracle
+
 # Distribution / packaging
 .Python
 build/

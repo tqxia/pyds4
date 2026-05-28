@@ -1,0 +1,7 @@
+{
+  "tensor": "blk.0.attn_kv.weight",
+  "n_blocks": 256,
+  "block_elems": 32,
+  "block_bytes": 34,
+  "n_elements": 8192
+}
