@@ -21,8 +21,11 @@ import pytest
 
 from pyds4 import gguf
 from pyds4.quant import (
+    IQ2_XXS_BLOCK_BYTES,
+    IQ2_XXS_BLOCK_ELEMS,
     Q8_0_BLOCK_BYTES,
     Q8_0_BLOCK_ELEMS,
+    dequant_iq2_xxs,
     dequant_q8_0,
     quantize_q8_0,
 )
@@ -32,12 +35,20 @@ DATA_DIR = Path(__file__).parent / "data"
 INPUT_BIN = DATA_DIR / "q8_0_input.bin"
 EXPECTED_BIN = DATA_DIR / "q8_0_expected.bin"
 META_JSON = DATA_DIR / "q8_0_meta.json"
+IQ2_INPUT_BIN = DATA_DIR / "iq2_xxs_input.bin"
+IQ2_EXPECTED_BIN = DATA_DIR / "iq2_xxs_expected.bin"
+IQ2_META_JSON = DATA_DIR / "iq2_xxs_meta.json"
 GGUF_PATH = Path("/home/tqxia/workspace/ds4/ds4flash.gguf")
 
 
 oracle_available = pytest.mark.skipif(
     not (INPUT_BIN.exists() and EXPECTED_BIN.exists() and META_JSON.exists()),
     reason="Q8_0 oracle not captured (run scripts/capture_q8_0_oracle.py)",
+)
+
+iq2_oracle_available = pytest.mark.skipif(
+    not (IQ2_INPUT_BIN.exists() and IQ2_EXPECTED_BIN.exists() and IQ2_META_JSON.exists()),
+    reason="IQ2_XXS oracle not captured (run scripts/capture_iq2_xxs_oracle.py)",
 )
 
 
@@ -131,3 +142,82 @@ def test_dequant_q8_0_real_tensor_sanity() -> None:
     # Trained weights are tiny but non-zero on average. A loose bound rules
     # out gross misreads (e.g. accidentally reading the scale as int8).
     assert 0.0 < np.abs(y).mean() < 1.0
+
+
+# ---------------------------------------------------------------------------
+# IQ2_XXS
+# ---------------------------------------------------------------------------
+
+
+@iq2_oracle_available
+def test_dequant_iq2_xxs_bit_exact_vs_c_oracle() -> None:
+    """Our fp32 output must match the C oracle byte-for-byte.
+
+    The IQ2_XXS dequant chain — f16→f32, four uint8 grid lookups, four 7-bit
+    sign lookups, and a single sub-block scalar multiply — is all IEEE 754
+    fp32 once `d` is upcast. Same operation order in our NumPy and the C
+    oracle ⇒ same bits.
+    """
+    meta = json.loads(IQ2_META_JSON.read_text())
+    n_elements = meta["n_elements"]
+    raw = IQ2_INPUT_BIN.read_bytes()
+    expected = np.frombuffer(IQ2_EXPECTED_BIN.read_bytes(), dtype=np.float32)
+
+    got = dequant_iq2_xxs(raw, n_elements)
+
+    assert got.shape == (n_elements,)
+    assert got.dtype == np.float32
+    assert got.tobytes() == expected.tobytes(), (
+        "IQ2_XXS dequant disagrees with C oracle "
+        f"(max abs diff: {np.max(np.abs(got - expected))})"
+    )
+
+
+def test_dequant_iq2_xxs_empty() -> None:
+    """Empty input → empty output (no buffer required)."""
+    y = dequant_iq2_xxs(b"", 0)
+    assert y.shape == (0,)
+    assert y.dtype == np.float32
+
+
+def test_dequant_iq2_xxs_buf_too_small() -> None:
+    """Caller error: too few bytes for the requested element count."""
+    with pytest.raises(ValueError, match="too small"):
+        dequant_iq2_xxs(b"\x00" * 65, IQ2_XXS_BLOCK_ELEMS)
+
+
+def test_dequant_iq2_xxs_zero_block() -> None:
+    """A pure-zero block: scale = 0 ⇒ every output is exactly 0.
+
+    With `d_bits = 0` the fp16 super-scale is +0.0, so every product is +0.0
+    regardless of grid / sign / ls_raw. Cheapest possible smoke test that the
+    block-size arithmetic is right.
+    """
+    raw = b"\x00" * IQ2_XXS_BLOCK_BYTES
+    y = dequant_iq2_xxs(raw, IQ2_XXS_BLOCK_ELEMS)
+    assert y.shape == (IQ2_XXS_BLOCK_ELEMS,)
+    assert np.all(y == 0.0)
+
+
+@pytest.mark.skipif(
+    not GGUF_PATH.exists(),
+    reason=f"ds4 GGUF not available at {GGUF_PATH}",
+)
+def test_dequant_iq2_xxs_real_tensor_sanity() -> None:
+    """End-to-end: dequant a real IQ2_XXS slice, sanity-check the result.
+
+    `blk.0.ffn_gate_exps.weight` is IQ2_XXS. We dequant 4 blocks (1024 elems)
+    and assert basic properties of MoE expert weights: finite, mostly small,
+    not all zero.
+    """
+    nblocks = 4
+    with gguf.parse(GGUF_PATH) as g:
+        t = g.tensors["blk.0.ffn_gate_exps.weight"]
+        assert t.dtype == 16  # IQ2_XXS
+        raw = bytes(g.tensor_bytes(t.name)[: nblocks * IQ2_XXS_BLOCK_BYTES])
+
+    y = dequant_iq2_xxs(raw, nblocks * IQ2_XXS_BLOCK_ELEMS)
+    assert y.shape == (nblocks * IQ2_XXS_BLOCK_ELEMS,)
+    assert np.isfinite(y).all()
+    assert np.abs(y).max() < 1.0
+    assert np.abs(y).mean() > 0.0

@@ -1,0 +1,7 @@
+{
+  "tensor": "blk.0.ffn_gate_exps.weight",
+  "n_blocks": 256,
+  "block_elems": 256,
+  "block_bytes": 66,
+  "n_elements": 65536
+}

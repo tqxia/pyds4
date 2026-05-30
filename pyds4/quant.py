@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from pyds4.quant_tables import IQ2XXS_GRID_BYTES, KSIGNS_IQ2XS_MASK
+
 
 # Q8_0: 32 elements per block. Layout per block (34 bytes):
 #   [0..2)   fp16 scale `d`     (little-endian)
@@ -103,3 +105,95 @@ def quantize_q8_0(x: np.ndarray) -> bytes:
     out[:, :2] = d_fp16.view(np.uint8).reshape(nb, 2)
     out[:, 2:] = q.view(np.uint8)
     return out.tobytes()
+
+
+# IQ2_XXS: 256 elements per block. Layout per block (66 bytes):
+#   [0..2)   fp16 super-scale `d`
+#   [2..66)  qs[32] uint16, equivalently 16 uint32, equivalently
+#            8 sub-blocks of 8 bytes each (one sub-block per 32 elements).
+#
+# Per sub-block (8 bytes = aux32[0], aux32[1] little-endian):
+#   aux32[0]: 4 grid indices, one per byte → 4 × 8 = 32 magnitudes.
+#   aux32[1]: 4 sign indices (7 bits each, bits 0..6, 7..13, 14..20, 21..27)
+#             + a 4-bit local-scale `ls_raw` (bits 28..31).
+#
+# The local scale lives at half-integer steps:
+#   ls = 2 * ls_raw + 1            (an odd integer in {1, 3, 5, ..., 31})
+#   per-element factor = ls / 8    (so range {1/8, 3/8, ..., 31/8})
+#
+# Dequant per element:
+#   d * (2 * ls_raw + 1) * 0.125 * sign * grid_byte
+# where `sign ∈ {-1, +1}` and `grid_byte` is a small positive integer.
+# Cross-referenced with ds4.c::ds4_vec_dot_iq2_xxs_q8_K (line 1910): the
+# scalar path computes `0.125 * d * grid_byte * sign * q8_byte * ls`, so the
+# factor we apply during dequant matches what ds4 applies during the dot.
+IQ2_XXS_BLOCK_ELEMS = 256
+IQ2_XXS_BLOCK_BYTES = 66
+
+
+def dequant_iq2_xxs(buf: bytes | memoryview, n_elements: int) -> np.ndarray:
+    """Dequantize an IQ2_XXS byte buffer to fp32.
+
+    `buf` must be at least `ceil(n_elements / 256) * 66` bytes long. Output is
+    exactly `n_elements` long; the tail of the last block is dropped if
+    `n_elements` is not a multiple of 256 (ds4's tensors are always 256-
+    aligned along the contiguous axis, so this only matters for tests).
+    """
+    if n_elements < 0:
+        raise ValueError(f"n_elements must be >= 0, got {n_elements}")
+    if n_elements == 0:
+        return np.empty(0, dtype=np.float32)
+
+    n_blocks = (n_elements + IQ2_XXS_BLOCK_ELEMS - 1) // IQ2_XXS_BLOCK_ELEMS
+    need = n_blocks * IQ2_XXS_BLOCK_BYTES
+    if len(buf) < need:
+        raise ValueError(
+            f"buf too small: have {len(buf)} bytes, need {need} for "
+            f"{n_blocks} blocks ({n_elements} elements)"
+        )
+
+    raw = np.frombuffer(buf, dtype=np.uint8, count=need).reshape(
+        n_blocks, IQ2_XXS_BLOCK_BYTES
+    )
+
+    # Super-scale d (fp16 → fp32, IEEE 754, bit-exact with ds4's f16_to_f32).
+    d = raw[:, :2].copy().view(np.float16).astype(np.float32).reshape(n_blocks)
+
+    # qs as (n_blocks, 8 sub-blocks, 8 bytes each). Sub-block = 32 elements.
+    qs = raw[:, 2:].reshape(n_blocks, 8, 8)
+
+    # Bytes 0..3 of each sub-block: four grid indices (0..255).
+    grid_idx = qs[:, :, 0:4]                                # (nb, 8, 4) uint8
+
+    # Bytes 4..7 of each sub-block: aux32[1] little-endian. Hold as uint32 so
+    # the shifts that pull out four 7-bit sign indices and the 4-bit local
+    # scale don't overflow.
+    aux_hi = (qs[:, :, 4].astype(np.uint32)
+              | (qs[:, :, 5].astype(np.uint32) << 8)
+              | (qs[:, :, 6].astype(np.uint32) << 16)
+              | (qs[:, :, 7].astype(np.uint32) << 24))      # (nb, 8) uint32
+
+    ls_raw = (aux_hi >> 28).astype(np.float32)              # (nb, 8) ∈ 0..15
+    # Pre-multiply d and the sub-block scale (2*ls_raw + 1)/8 into a single
+    # factor — one fp32 broadcast per sub-block instead of two.
+    sub_scale = d[:, None] * (2.0 * ls_raw + 1.0) * 0.125   # (nb, 8)
+
+    # Four 7-bit sign indices stacked along a new axis: bits 0..6, 7..13, 14..20, 21..27.
+    sign_idx = np.stack(
+        [(aux_hi >> (7 * g)) & np.uint32(0x7F) for g in range(4)],
+        axis=-1,
+    ).astype(np.uint8)                                      # (nb, 8, 4) uint8
+
+    # Vectorized lookups. The grid lookup yields the 8 magnitude bytes for
+    # each of the 4 groups in each sub-block; the sign lookup yields the
+    # matching 8 sign values (+1 / -1).
+    grid_vals = IQ2XXS_GRID_BYTES[grid_idx]                 # (nb, 8, 4, 8) int8
+    sign_vals = KSIGNS_IQ2XS_MASK[sign_idx]                 # (nb, 8, 4, 8) int8
+
+    # Cast to fp32 once. The product never exceeds ~|grid|*1 = ~43, well
+    # within int8, but doing the multiply in fp32 keeps the chain monotonic
+    # with the C oracle (scale * (float)signed_byte).
+    signed = (grid_vals * sign_vals).astype(np.float32)     # (nb, 8, 4, 8)
+
+    out = signed * sub_scale[:, :, None, None]              # (nb, 8, 4, 8)
+    return out.reshape(-1)[:n_elements]
