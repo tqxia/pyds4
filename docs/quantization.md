@@ -167,61 +167,171 @@ tensors the absolute byte cost is tiny so there's no reason to push further.
 
 ## 5. IQ2_XXS — codebook + 7-bit signs (2 bits per element)
 
-Here's where it gets interesting. "Pure" 2 bits per element would give you
-only 4 distinct values per weight — far too coarse for transformer weights.
-IQ2_XXS sidesteps this by storing **groups of 8 elements together** as a
-pointer into a 256-entry codebook of vectors. The codebook lives in
-`ds4_iq2_tables_cuda.inc` and was optimized offline against the empirical
-weight distribution.
+This is the most interesting of the three formats, and the most confusing
+on first read. The trick is unlike anything in Q8_0 or Q2_K: weights don't
+get quantized one at a time. They get quantized **eight at a time**, as a
+pointer into a hand-tuned table.
 
-**Block layout** (256 elements, 66 bytes):
+### 5.1 The core idea: you can't afford 2 bits per weight, so don't try
+
+Forget IQ2 for a second and imagine a naive 2-bit scheme. That's 4 distinct
+values per weight — say `{-1.5, -0.5, +0.5, +1.5}` times a block scale.
+Every weight has to pick one of those four. For a 7168-wide MLP that's
+catastrophic: neighbors round independently, the errors don't cancel, and
+the matmul output drifts badly.
+
+IQ2_XXS sidesteps this by *not* quantizing weights individually. Instead:
+
+> Every group of 8 consecutive weights picks one of N predefined 8-vectors.
+
+That's a **codebook**. Like a 256-color palette for an image — instead of
+letting every pixel be any RGB value, you precompute 256 "good" colors
+offline (e.g. k-means on real photos), and every pixel stores an 8-bit
+index into the palette. IQ2_XXS does the same thing, but the palette
+entries are 8-element weight vectors chosen offline to match the empirical
+distribution of transformer MLP weights. The codebook ships with the
+format itself — `iq2xxs_grid[256]` in `ds4_iq2_tables_cuda.inc`.
+
+### 5.2 Why 8 elements
+
+Look at the math:
+
+- **Per element**, 2 bits gives you 4 values. Crude.
+- **Per group of 8**, 2 × 8 = 16 bits gives you 65 536 possible vectors.
+  But if you let any 16-bit pattern in, you've wasted the structure.
+- IQ2_XXS uses **15 bits per group of 8** (8 grid index + 7 sign index)
+  and constrains those bits to a hand-tuned lattice of
+  **256 magnitude patterns × 128 sign patterns = 32 768 8-vectors**. That's
+  still vastly more expressive than a flat 2-bit scheme, and the lattice
+  is chosen so most real weight 8-tuples land near a lattice point.
+
+So the "2 bits per element" is amortized — elements don't get bits
+individually; the group does.
+
+### 5.3 Why magnitudes and signs are factored apart
+
+Real transformer weights are roughly symmetric around zero: for every
+`+w` there's roughly an equal `-w`. So instead of storing the codebook as
+256 signed 8-vectors plus a mirror copy for sign flips, IQ2_XXS factors
+that out:
+
+- **256-entry grid table.** Each entry is 8 *positive* small integers
+  (`{1, 3, 5, 9, ...}`, packed as one `uint64`).
+- **128-entry sign table.** Each entry is an 8-bit mask saying which of
+  the 8 positions to negate.
+
+A "lattice point" is then `grid[g] * signs[s]`, elementwise. Splitting
+magnitude × sign doubles the effective codebook size without doubling
+its storage. That's the "7-bit signs" name: each 8-element group spends
+8 bits naming the magnitude pattern and 7 bits naming the sign pattern.
+
+### 5.4 The scale hierarchy
+
+Magnitudes in the grid are tiny integers — but real weights have a
+range. So you multiply by a scale. IQ2_XXS scales at **two levels**:
+
+```
+super-scale d       : one fp16 per 256 elements   ← range across the whole 256-block
+sub-scale  ls_raw   : 4 bits per 32 elements      ← local detail per sub-block
+```
+
+The actual per-element multiplier is `d * (2*ls_raw + 1) * 0.125`. The
+weird `(2*ls_raw + 1) * 0.125` expression is just "an odd number between
+1/8 and 31/8" — 16 possible per-sub-block scale multipliers on top of the
+super-scale. The full reconstruction per element is:
+
+```
+weight = d * (2*ls_raw + 1) * 0.125  *  sign[k] * grid_magnitude[k]
+         └─ super ─┘ └── sub ──┘         └── lookup, the codebook entry ──┘
+```
+
+Two scales, a sign, and a magnitude lookup.
+
+### 5.5 How 256 elements pack into 66 bytes
 
 ```
 struct block_iq2_xxs {
-    uint16_t d;          // fp16 super-scale
-    uint16_t qs[32];     // 8 sub-blocks of 8 bytes each
+    uint16_t d;          // fp16 super-scale  (2 bytes)
+    uint16_t qs[32];     // 8 sub-blocks × 8 bytes  (64 bytes)
 };
 ```
 
-Each 32-element **sub-block** packs into 8 bytes (= two uint32):
+Each 8-byte sub-block holds **32 elements** (4 groups of 8). Reading
+those 8 bytes as two `uint32`:
 
 ```
-aux32[0]: |  g0  |  g1  |  g2  |  g3  |    ← 4 grid indices (8 bits each)
-aux32[1]: | s0      | s1      | s2      | s3      | ls_raw |
-          bits 0-6   7-13     14-20    21-27     28-31
-                  ↑ 4 sign indices (7 bits each)   ↑ local scale (4 bits)
+aux32[0]: |  g0:8  |  g1:8  |  g2:8  |  g3:8  |           ← 4 grid indices
+aux32[1]: | s0:7 | s1:7 | s2:7 | s3:7 | ls_raw:4 |        ← 4 sign indices + local scale
+          bits 0-6  7-13  14-20  21-27 bits 28-31
 ```
 
-Each grid index `gi` points into `iq2xxs_grid[256]`, a table of 8 small
-positive integers (packed as one `uint64`). Each sign index `si` points into
-`ksigns_iq2xs[128]`, an 8-bit mask that tells us which of the 8 grid
-positions should be negated. So a sub-block produces:
+Per sub-block: 4 magnitude pointers + 4 sign pointers + 1 local scale =
+64 bits to describe 32 elements. Add its 1/8 share of the fp16 super-scale
+(0.0625 bits/elem) and you get **2.0625 bits/elem**. That's the headline
+number.
+
+### 5.6 Concrete walk-through of one group of 8
+
+Say within some sub-block: `g0 = 47`, `s0 = 13`, `ls_raw = 5`, super-scale
+`d = 0.0042`.
+
+1. **Look up the magnitude pattern.** `iq2xxs_grid[47]` is a `uint64` —
+   interpret its 8 bytes as 8 small positive ints, e.g.
+   `[3, 1, 5, 1, 1, 7, 3, 1]`.
+2. **Look up the signs.** `ksigns_iq2xs[13]` is one byte, say `0b01010011`.
+   Each bit is "flip this position?" → `[-1, -1, +1, +1, -1, +1, -1, +1]`.
+3. **Per-sub-block scale.** `sub_scale = 0.0042 * (2*5 + 1) * 0.125
+   = 0.0042 * 11/8 ≈ 0.005775`.
+4. **Multiply elementwise.**
+   ```
+   ≈ 0.005775 * [-3, -1, +5, +1, -1, +7, -3, +1]
+   = [-0.0173, -0.0058, +0.0289, +0.0058, -0.0058, +0.0404, -0.0173, +0.0058]
+   ```
+
+That's the dequant for those 8 elements. Repeat 3 more times (g1/s1,
+g2/s2, g3/s3) for the rest of the sub-block, with the same `sub_scale`.
+Repeat 7 more sub-blocks (each has its own `ls_raw`), all sharing the
+same fp16 `d`. You've reconstructed all 256 elements of the block.
+
+### 5.7 How the NumPy code maps to all this
+
+`pyds4/quant.py::dequant_iq2_xxs` does the above, vectorized over every
+block at once:
 
 ```
-for j in 0..3:
-    grid    = iq2xxs_grid[gj]          # 8 magnitudes ∈ {8, 25, 43, ...}
-    signs   = ksigns_iq2xs[sj]         # 8 ±1 from bit mask
-    sub_scale = d * (2*ls_raw + 1) / 8 # per-sub-block scale, half-integer in {1/8, 3/8, ...}
-    out[j*8 + k] = sub_scale * signs[k] * grid[k]
+raw           shape (nb, 66)         ← raw bytes per block
+d             shape (nb,)            ← bytes 0..1, view as fp16, cast fp32
+qs            shape (nb, 8, 8)       ← the 64 sub-block bytes per block
+grid_idx      shape (nb, 8, 4)       ← bytes 0..3 of each sub-block: the g's
+aux_hi        shape (nb, 8)          ← bytes 4..7 reassembled as a uint32
+ls_raw        shape (nb, 8)          ← top 4 bits of aux_hi
+sign_idx      shape (nb, 8, 4)       ← four 7-bit slices of aux_hi: the s's
+grid_vals     shape (nb, 8, 4, 8)    ← IQ2XXS_GRID_BYTES[grid_idx]    (table lookup)
+sign_vals     shape (nb, 8, 4, 8)    ← KSIGNS_IQ2XS_MASK[sign_idx]    (table lookup, ±1)
+sub_scale     shape (nb, 8, 1, 1)    ← d[:,None] * (2*ls_raw + 1) * 0.125
+out           shape (nb, 8, 4, 8)    ← grid_vals * sign_vals * sub_scale
+              .reshape(-1)[:n]
 ```
 
-That's literally what `pyds4/quant.py::dequant_iq2_xxs` does, vectorized over
-all blocks at once.
+Two table lookups (`IQ2XXS_GRID_BYTES[grid_idx]` and
+`KSIGNS_IQ2XS_MASK[sign_idx]`) index the codebook in parallel across every
+block. One broadcast multiply finishes it. No Python loops, no per-element
+work — and because the chain is just IEEE 754 fp16→fp32 plus fp32
+multiplies, our output is byte-equal to the C oracle
+(`test_dequant_iq2_xxs_bit_exact_vs_c_oracle`).
 
-**Why this is more accurate than a naive 2-bit linear scheme**
+### 5.8 Two-line summary
 
-In a flat 2-bit scheme, every weight is one of 4 values; consecutive weights
-are independent. In IQ2_XXS, every group of 8 consecutive weights is
-constrained to be one of `256 grids × 128 signs = 32768` rigid patterns. The
-8-element lattice was tuned offline so most actually-occurring weight
-patterns land near a lattice point. You get 2.0625 bits/elem (8 bits grid +
-7 bits sign per 8 elements + 4 bits local scale per 32 elements + fp16
-super-scale per 256 elements) and accuracy comparable to a hypothetical
-3-bit linear scheme.
+- **Codebook idea.** 8 weights at a time get assigned to one of 32 768
+  hand-tuned 8-vectors (256 magnitudes × 128 signs), much more expressive
+  than any flat 2-bit scheme.
+- **Bit budget.** 8 bits/grid-index + 7 bits/sign-index per group of 8
+  (= 15 bits / 8 elems), plus 4 bits/sub-scale per 32 elems, plus
+  16 bits/super-scale per 256 elems → **2.0625 bits/elem**.
 
-This is also why the dequant is table-driven, not arithmetic — there's no
-closed-form `q → x` because `q` is a pointer, not a number. Triton kernels
-get to enjoy this in M14.
+The dequant is **table-driven, not arithmetic** — there's no closed-form
+`q → x` because `q` is a pointer into the codebook, not a number. Triton
+kernels get to enjoy this in M14.
 
 ## 6. Q2_K — asymmetric K-quant (2.625 bits per element)
 
