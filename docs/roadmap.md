@@ -96,12 +96,29 @@ three formats cover every quantized tensor in ds4flash.gguf; everything else
 End-to-end code path exists. **Logit parity is not yet expected** — we're
 using dense causal attention as a stand-in for CSA + HCA.
 
-### M7. Model skeleton — **open**
+### M7. Model skeleton — **done** (`bb41b5f`)
 - **Goal:** `DS4Model.__init__` builds all layer parameters and loads weights
   via the Phase B dequant. No `forward()` yet.
 - **Artifact:** `pyds4/model.py`, `pyds4/layers/{rms,attention,moe,hc}.py`.
-- **Oracle:** instantiation succeeds + total parameter count matches the
-  `ds4_engine_summary` number.
+  Every leaf is declared on `device='meta'` by default, so building the full
+  43-layer 284 B-parameter graph allocates only shape metadata. Optional
+  sub-modules (HCA Compressor, CSA Indexer, hash-routing table, learned
+  router bias) are gated by per-layer `compress_ratio` and `n_hash_layer`,
+  matching the conditional layout in `ds4.c::weights_validate_layout`.
+  `build_name_map(cfg)` is a pure function returning a bijective map from
+  GGUF tensor name to dotted model `state_dict` key — shape-preserving, no
+  transposes. `DS4Model.load_weights(g, device, dtype, names=...)`
+  materializes parameters off meta via the Phase B dequant kernels (Q8_0 /
+  IQ2_XXS / Q2_K / raw F32/F16/I32); a full load is deferred to later
+  phases since the 81 GB GGUF expands past any single-device budget.
+- **Oracle:** `tests/test_model.py` (6 tests, all pass) — meta instantiation
+  allocates nothing; the name map's targets are unique; `sum(p.numel())`
+  across `state_dict` equals **284,334,567,511** — exactly the "logical
+  parameters" number `ds4_engine_summary` prints for `ds4flash.gguf`; the
+  GGUF↔model name map is bijective on all 1328 tensors with zero orphans
+  on either side; every per-tensor shape matches (not just totals); a
+  partial `load_weights` smoke test loads 43 `attn_norm` tensors to CPU
+  fp32 and verifies plausible DS4 pre-norm gain statistics.
 
 ### M8. Forward pass, naive — **open** (five sub-milestones)
 - **M8a.** Token embedding (HC space) + final norm + LM head. Forward a
