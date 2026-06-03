@@ -9,6 +9,7 @@ __pycache__/
 # Compiled oracle binaries (scripts/*.c → scripts/<name>)
 scripts/q8_0_oracle
 scripts/iq2_xxs_oracle
+scripts/q2_k_oracle
 
 # Distribution / packaging
 .Python

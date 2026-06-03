@@ -23,9 +23,12 @@ from pyds4 import gguf
 from pyds4.quant import (
     IQ2_XXS_BLOCK_BYTES,
     IQ2_XXS_BLOCK_ELEMS,
+    Q2_K_BLOCK_BYTES,
+    Q2_K_BLOCK_ELEMS,
     Q8_0_BLOCK_BYTES,
     Q8_0_BLOCK_ELEMS,
     dequant_iq2_xxs,
+    dequant_q2_k,
     dequant_q8_0,
     quantize_q8_0,
 )
@@ -38,6 +41,9 @@ META_JSON = DATA_DIR / "q8_0_meta.json"
 IQ2_INPUT_BIN = DATA_DIR / "iq2_xxs_input.bin"
 IQ2_EXPECTED_BIN = DATA_DIR / "iq2_xxs_expected.bin"
 IQ2_META_JSON = DATA_DIR / "iq2_xxs_meta.json"
+Q2K_INPUT_BIN = DATA_DIR / "q2_k_input.bin"
+Q2K_EXPECTED_BIN = DATA_DIR / "q2_k_expected.bin"
+Q2K_META_JSON = DATA_DIR / "q2_k_meta.json"
 GGUF_PATH = Path("/home/tqxia/workspace/ds4/ds4flash.gguf")
 
 
@@ -49,6 +55,11 @@ oracle_available = pytest.mark.skipif(
 iq2_oracle_available = pytest.mark.skipif(
     not (IQ2_INPUT_BIN.exists() and IQ2_EXPECTED_BIN.exists() and IQ2_META_JSON.exists()),
     reason="IQ2_XXS oracle not captured (run scripts/capture_iq2_xxs_oracle.py)",
+)
+
+q2k_oracle_available = pytest.mark.skipif(
+    not (Q2K_INPUT_BIN.exists() and Q2K_EXPECTED_BIN.exists() and Q2K_META_JSON.exists()),
+    reason="Q2_K oracle not captured (run scripts/capture_q2_k_oracle.py)",
 )
 
 
@@ -218,6 +229,87 @@ def test_dequant_iq2_xxs_real_tensor_sanity() -> None:
 
     y = dequant_iq2_xxs(raw, nblocks * IQ2_XXS_BLOCK_ELEMS)
     assert y.shape == (nblocks * IQ2_XXS_BLOCK_ELEMS,)
+    assert np.isfinite(y).all()
+    assert np.abs(y).max() < 1.0
+    assert np.abs(y).mean() > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Q2_K
+# ---------------------------------------------------------------------------
+
+
+@q2k_oracle_available
+def test_dequant_q2_k_bit_exact_vs_c_oracle() -> None:
+    """Our fp32 output must match the C oracle byte-for-byte.
+
+    The Q2_K dequant chain — two fp16→fp32 casts, two fp32 multiplies into
+    `d_sc` and `dmin_mn`, one fp32 multiply by `q`, one fp32 subtract —
+    has zero implementation freedom under IEEE 754 once the operation order
+    is fixed. Our NumPy uses the same hoisting as the C oracle, so the
+    output must be byte-equal.
+    """
+    meta = json.loads(Q2K_META_JSON.read_text())
+    n_elements = meta["n_elements"]
+    raw = Q2K_INPUT_BIN.read_bytes()
+    expected = np.frombuffer(Q2K_EXPECTED_BIN.read_bytes(), dtype=np.float32)
+
+    got = dequant_q2_k(raw, n_elements)
+
+    assert got.shape == (n_elements,)
+    assert got.dtype == np.float32
+    assert got.tobytes() == expected.tobytes(), (
+        "Q2_K dequant disagrees with C oracle "
+        f"(max abs diff: {np.max(np.abs(got - expected))})"
+    )
+
+
+def test_dequant_q2_k_empty() -> None:
+    """Empty input → empty output (no buffer required)."""
+    y = dequant_q2_k(b"", 0)
+    assert y.shape == (0,)
+    assert y.dtype == np.float32
+
+
+def test_dequant_q2_k_buf_too_small() -> None:
+    """Caller error: too few bytes for the requested element count."""
+    with pytest.raises(ValueError, match="too small"):
+        dequant_q2_k(b"\x00" * 83, Q2_K_BLOCK_ELEMS)
+
+
+def test_dequant_q2_k_zero_block() -> None:
+    """A pure-zero block: d = 0, dmin = 0 ⇒ every output is exactly 0.
+
+    With all bytes zero, scales/qs are zero (so `sc = mn = q = 0`) and both
+    fp16 super-values are +0.0. Each per-element product is +0.0 - +0.0 =
+    +0.0. Cheapest possible smoke test that the block-size arithmetic and
+    the field offsets are right.
+    """
+    raw = b"\x00" * Q2_K_BLOCK_BYTES
+    y = dequant_q2_k(raw, Q2_K_BLOCK_ELEMS)
+    assert y.shape == (Q2_K_BLOCK_ELEMS,)
+    assert np.all(y == 0.0)
+
+
+@pytest.mark.skipif(
+    not GGUF_PATH.exists(),
+    reason=f"ds4 GGUF not available at {GGUF_PATH}",
+)
+def test_dequant_q2_k_real_tensor_sanity() -> None:
+    """End-to-end: dequant a real Q2_K slice, sanity-check the result.
+
+    `blk.0.ffn_down_exps.weight` is Q2_K. We dequant 4 blocks (1024 elems)
+    and assert basic properties of MoE expert weights: finite, mostly
+    small, not all zero.
+    """
+    nblocks = 4
+    with gguf.parse(GGUF_PATH) as g:
+        t = g.tensors["blk.0.ffn_down_exps.weight"]
+        assert t.dtype == 10  # Q2_K
+        raw = bytes(g.tensor_bytes(t.name)[: nblocks * Q2_K_BLOCK_BYTES])
+
+    y = dequant_q2_k(raw, nblocks * Q2_K_BLOCK_ELEMS)
+    assert y.shape == (nblocks * Q2_K_BLOCK_ELEMS,)
     assert np.isfinite(y).all()
     assert np.abs(y).max() < 1.0
     assert np.abs(y).mean() > 0.0

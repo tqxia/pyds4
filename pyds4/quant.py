@@ -197,3 +197,92 @@ def dequant_iq2_xxs(buf: bytes | memoryview, n_elements: int) -> np.ndarray:
 
     out = signed * sub_scale[:, :, None, None]              # (nb, 8, 4, 8)
     return out.reshape(-1)[:n_elements]
+
+
+# Q2_K: 256 elements per block. Layout per block (84 bytes):
+#   [0..16)   scales[16]  uint8  — each byte holds (sub-min : 4) << 4 | (sub-scale : 4)
+#   [16..80)  qs[64]      uint8  — 2-bit quants, four elements packed per byte
+#   [80..82)  d           fp16   — super-scale
+#   [82..84)  dmin        fp16   — super-min
+#
+# The 256 elements split into 16 sub-blocks of 16 elements each. The packing in
+# qs is interleaved so that one byte contributes one element to each of four
+# sub-blocks (at bit-shifts 0, 2, 4, 6). The dot-product loop in
+# ds4.c::ds4_vec_dot_q2_K_q8_K (line 1888 onward, non-NEON path) makes the
+# mapping explicit. Reading element s (sub-block 0..15) at position i (0..15):
+#
+#   k                = s // 8         # which 32-byte half of qs
+#   second_in_pair   = s & 1          # which 16-byte slice of that half
+#   pair_idx         = (s >> 1) & 3   # which 2-bit slot inside each byte
+#   shift            = 2 * pair_idx
+#   byte             = qs[32*k + 16*second_in_pair + i]
+#   q                = (byte >> shift) & 0x3
+#
+# Per-element dequant: x = d * sc * q - dmin * mn, where
+#   sc = scales[s] & 0x0f, mn = scales[s] >> 4.
+Q2_K_BLOCK_ELEMS = 256
+Q2_K_BLOCK_BYTES = 84
+
+
+def dequant_q2_k(buf: bytes | memoryview, n_elements: int) -> np.ndarray:
+    """Dequantize a Q2_K byte buffer to fp32.
+
+    `buf` must be at least `ceil(n_elements / 256) * 84` bytes long. Output is
+    exactly `n_elements` long; the tail of the last block is dropped if
+    `n_elements` is not a multiple of 256 (ds4's tensors are always 256-
+    aligned along the contiguous axis, so this only matters for tests).
+
+    Numerically bit-exact against ds4: two IEEE-754 fp16→fp32 casts, two
+    fp32 multiplies into `d_sc` / `dmin_mn`, one multiply by `q`, and one
+    subtract. Hoisting `d_sc` and `dmin_mn` once per sub-block matches the
+    C oracle and pins the operation order — no associativity wiggle room.
+    """
+    if n_elements < 0:
+        raise ValueError(f"n_elements must be >= 0, got {n_elements}")
+    if n_elements == 0:
+        return np.empty(0, dtype=np.float32)
+
+    n_blocks = (n_elements + Q2_K_BLOCK_ELEMS - 1) // Q2_K_BLOCK_ELEMS
+    need = n_blocks * Q2_K_BLOCK_BYTES
+    if len(buf) < need:
+        raise ValueError(
+            f"buf too small: have {len(buf)} bytes, need {need} for "
+            f"{n_blocks} blocks ({n_elements} elements)"
+        )
+
+    raw = np.frombuffer(buf, dtype=np.uint8, count=need).reshape(
+        n_blocks, Q2_K_BLOCK_BYTES
+    )
+
+    # Per-sub-block 4-bit (scale, min) packed in scales[16]: low nibble = sub
+    # scale, high nibble = sub min.
+    scales = raw[:, :16]                                    # (nb, 16) uint8
+    sub_scale = (scales & 0x0F).astype(np.float32)          # (nb, 16)
+    sub_min = (scales >> 4).astype(np.float32)              # (nb, 16)
+
+    # qs as (nb, 2 halves, 2 slices, 16 bytes). The four 2-bit slots inside
+    # each byte (shifts 0, 2, 4, 6) belong to sub-blocks at the same
+    # (half, slice) but at four different `pair_idx` values.
+    qs = raw[:, 16:80].reshape(n_blocks, 2, 2, 16)          # (nb, k, sip, byte)
+    shifts = np.array([0, 2, 4, 6], dtype=np.uint8)
+    # Extract all four shifts at once → axis order (nb, k, sip, byte, pair).
+    vals = (qs[..., None] >> shifts) & np.uint8(0x3)        # (nb, 2, 2, 16, 4)
+    # Reorder to (nb, k, pair, sip, byte) so that flattening the middle three
+    # axes yields sub-block index 8*k + 2*pair + sip.
+    q_values = vals.transpose(0, 1, 4, 2, 3).reshape(
+        n_blocks, 16, 16
+    ).astype(np.float32)                                    # (nb, 16, 16)
+
+    # Super-scale d and super-min dmin: trailing 4 bytes of the block as
+    # two little-endian fp16 values.
+    d = raw[:, 80:82].copy().view(np.float16).astype(np.float32).reshape(n_blocks)
+    dmin = raw[:, 82:84].copy().view(np.float16).astype(np.float32).reshape(n_blocks)
+
+    # Hoist the two multiplies that don't depend on `q` — the C oracle does
+    # the same, so the operation order is identical and the output is
+    # byte-equal.
+    d_sc = d[:, None] * sub_scale                           # (nb, 16)
+    dmin_mn = dmin[:, None] * sub_min                       # (nb, 16)
+
+    out = d_sc[:, :, None] * q_values - dmin_mn[:, :, None] # (nb, 16, 16)
+    return out.reshape(-1)[:n_elements]
