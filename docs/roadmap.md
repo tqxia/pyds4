@@ -73,15 +73,19 @@ three formats cover every quantized tensor in ds4flash.gguf; everything else
   of `blk.0.ffn_gate_exps.weight`.
   `test_dequant_iq2_xxs_bit_exact_vs_c_oracle` is **byte-equal**.
 
-### M6. Q2_K dequant — **open**
+### M6. Q2_K dequant — **done** (`2784dc7`)
 - **Goal:** dequant the 256-element / 84-byte super-blocks used by routed
   down experts. Two-level scaling: super-block fp16 `d` + `dmin`, plus 16
-  sub-block 4-bit scales packed in `scales[16]`. Per-element quants are
-  2-bit packed into `qs[64]`.
-- **Artifact:** `pyds4/quant.py::dequant_q2_k` (NumPy, same shape as M4/M5).
-- **Oracle:** `scripts/q2_k_oracle.c` — port the scalar dequant from
-  `ds4.c::ds4_vec_dot_q2_K_q8_K`. Capture a slice of
-  `blk.0.ffn_down_exps.weight`. Bit-exact target.
+  sub-block 4-bit (scale, min) packed in `scales[16]`. Per-element quants
+  are 2-bit packed into `qs[64]` at shifts 0/2/4/6 (one byte feeds four
+  sub-blocks across two halves of the block).
+- **Artifact:** `pyds4/quant.py::dequant_q2_k` (NumPy, same shape as
+  M4/M5). Hoists `d_sc = d * sc` and `dmin_mn = dmin * mn` once per
+  sub-block so the operation order matches the C oracle exactly.
+- **Oracle:** `scripts/q2_k_oracle.c` — verbatim `f16_to_f32` plus the
+  scalar dequant from `ds4.c::ds4_vec_dot_q2_K_q8_K` (non-NEON path).
+  Captured 65,536 elements of `blk.0.ffn_down_exps.weight`.
+  `test_dequant_q2_k_bit_exact_vs_c_oracle` is **byte-equal** (zero diff).
 - **Why:** finishes Phase B. After M6 we can load every weight tensor in
   ds4flash.gguf and convert it to a PyTorch fp32 tensor.
 
