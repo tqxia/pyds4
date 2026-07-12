@@ -8,7 +8,12 @@ from pyds4.layers.attention import Attention, Compressor, Indexer
 from pyds4.layers.hc import HyperConnections, OutputHC
 from pyds4.layers.moe import MoEFFN
 from pyds4.layers.rms import RMSNorm, rms_norm_no_weight, rms_norm_weight
-from pyds4.layers.rope import precompute_rope_freqs, rope_forward, rope_inverse
+from pyds4.layers.rope import (
+    precompute_layer_rope_freqs,
+    precompute_rope_freqs,
+    rope_forward,
+    rope_inverse,
+)
 
 __all__ = [
     "Attention",
@@ -19,6 +24,7 @@ __all__ = [
     "OutputHC",
     "RMSNorm",
     "precompute_rope_freqs",
+    "precompute_layer_rope_freqs",
     "rms_norm_no_weight",
     "rms_norm_weight",
     "rope_forward",

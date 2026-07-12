@@ -30,9 +30,9 @@ DeepSeek V4 Flash has three attention paths that read the same KV cache:
        indexer_compressor_gate: (n_embd, 2*ix_hdim)      F16
        indexer_compressor_ape:  (2*ix_hdim, 4)           F16
 
-M8 forward uses only the main MLA path with dense causal attention.
-Compressor and Indexer are declared as parameters but forward() is a no-op
-for now (landing in M9/M10).
+M9 implements the raw MLA path: layer-specific RoPE, DS4's E4M3 cache
+round-trip, sink-aware causal sliding-window attention, inverse RoPE, and the
+grouped output projection. Compressor and Indexer forward paths land in M10/M11.
 
 Shape conventions match the GGUF tensor descs verbatim so the
 GGUF→model weight loader is an identity on shape.
@@ -52,6 +52,91 @@ def _compressor_width(cfg: DS4Config, ratio: int) -> int:
     """Per ds4.c: comp_width = (ratio == 4 ? 2 : 1) * head_dim."""
     coff = 2 if ratio == 4 else 1
     return coff * cfg.head_dim
+
+
+_E4M3FN_LEVELS = (
+    0.0, 0.001953125, 0.00390625, 0.005859375, 0.0078125, 0.009765625,
+    0.01171875, 0.013671875,
+) + tuple(
+    (1.0 + mant * 0.125) * (2.0 ** (exp - 7))
+    for exp in range(1, 16)
+    for mant in range(8)
+)[:-1]  # ds4 accepts finite E4M3 codes 0..126 (maximum 448).
+
+
+def quantize_fp8_kv(kv: torch.Tensor, n_rot: int) -> torch.Tensor:
+    """Simulate ds4's block-scaled E4M3 round trip for raw KV rows.
+
+    The non-RoPE prefix is quantized in independent 64-value blocks. The
+    rotated tail is preserved. The returned cache tensor is float32, matching
+    ds4's dequantized activation cache rather than a packed byte format.
+    """
+    head_dim = kv.shape[-1]
+    n_nope = head_dim - n_rot
+    if n_nope < 0 or n_nope % 64 != 0:
+        raise ValueError("non-RoPE KV width must be non-negative and 64-aligned")
+
+    out = kv.float().clone()
+    if n_nope == 0:
+        return out
+
+    prefix = out[..., :n_nope]
+    blocks = prefix.reshape(*prefix.shape[:-1], n_nope // 64, 64)
+    amax = blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1.0e-4)
+    scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
+    normalized = (blocks / scale).clamp(-448.0, 448.0)
+
+    levels = torch.tensor(_E4M3FN_LEVELS, device=kv.device, dtype=torch.float32)
+    absolute = normalized.abs().contiguous()
+    lo = torch.searchsorted(levels, absolute, right=True) - 1
+    lo = lo.clamp(0, len(_E4M3FN_LEVELS) - 1)
+    hi = (lo + 1).clamp(max=len(_E4M3FN_LEVELS) - 1)
+    lo_value = levels[lo]
+    hi_value = levels[hi]
+    lo_diff = (absolute - lo_value).abs()
+    hi_diff = (hi_value - absolute).abs()
+    ties_to_even = (hi_diff == lo_diff) & ((hi & 1) == 0) & ((lo & 1) != 0)
+    use_hi = (hi_diff < lo_diff) | ties_to_even
+    magnitude = torch.where(use_hi, hi_value, lo_value)
+    quantized = torch.where(normalized < 0.0, -magnitude, magnitude) * scale
+    out[..., :n_nope] = quantized.reshape_as(prefix)
+    return out
+
+
+def raw_sliding_window_attention(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    sinks: torch.Tensor,
+    window: int,
+) -> torch.Tensor:
+    """DS4 raw prefill attention over the causal trailing window.
+
+    ``q`` is ``(seq, n_head, head_dim)`` and ``kv`` is ``(seq, head_dim)``.
+    The learned sink is an extra zero-valued softmax row.
+    """
+    seq, n_head, head_dim = q.shape
+    if kv.shape != (seq, head_dim):
+        raise ValueError(f"expected kv shape {(seq, head_dim)}, got {tuple(kv.shape)}")
+    if window < 0:
+        raise ValueError("window must be non-negative")
+
+    scores = torch.matmul(
+        q.float().transpose(0, 1),
+        kv.float().T.unsqueeze(0),
+    ) * (head_dim ** -0.5)
+
+    query = torch.arange(seq, device=q.device).unsqueeze(1)
+    key = torch.arange(seq, device=q.device).unsqueeze(0)
+    distance = query - key
+    valid = distance >= 0
+    if window:
+        valid &= distance < window
+    scores = scores.masked_fill(~valid.unsqueeze(0), float("-inf"))
+
+    sink_scores = sinks.float().reshape(n_head, 1, 1).expand(-1, seq, -1)
+    probabilities = torch.softmax(torch.cat([scores, sink_scores], dim=-1), dim=-1)
+    real_probabilities = probabilities[..., :seq]
+    return torch.matmul(real_probabilities, kv.float().unsqueeze(0)).transpose(0, 1)
 
 
 class Compressor(nn.Module):
@@ -116,9 +201,10 @@ class Indexer(nn.Module):
 
 
 class Attention(nn.Module):
-    """Per-layer attention: main MLA path with dense causal attention.
+    """Per-layer attention with the M9 raw sliding-window MLA path.
 
-    M8: dense causal only. Compressor/Indexer forward lands in M9/M10.
+    Compressor and indexer parameters are declared; their forward paths are
+    added by M10 and M11.
     """
 
     def __init__(
@@ -188,7 +274,7 @@ class Attention(nn.Module):
             self.indexer = Indexer(cfg, device=device)
 
     # ------------------------------------------------------------------
-    # Forward — dense causal MLA attention (M8b)
+    # Forward — raw sliding-window MLA attention (M9)
     # ------------------------------------------------------------------
 
     def forward(
@@ -202,7 +288,7 @@ class Attention(nn.Module):
         out_group: int,
         lora_o: int,
     ) -> torch.Tensor:
-        """Dense causal self-attention (MLA-style, no compressor/indexer).
+        """Raw causal sliding-window attention (no compressor/indexer yet).
 
         x:         (seq, n_embd) — pre-RMS-normed input
         positions: (seq,)        — position IDs
@@ -210,7 +296,6 @@ class Attention(nn.Module):
         Returns:   (seq, n_embd) — attention output (pre-HC-post)
         """
         seq = x.shape[0]
-        device = x.device
         dtype = x.dtype
         nope = head_dim - n_rot  # 448
 
@@ -245,34 +330,15 @@ class Attention(nn.Module):
             kv_rope.reshape(-1, n_rot), positions, inv_freq
         ).reshape(seq, 1, n_rot)
 
-        # Recombine
+        # Recombine and simulate the raw-cache E4M3 round trip.
         q_full = torch.cat([q_nope, q_rope_rot], dim=-1)       # (seq, n_head, head_dim)
-        kv_full = torch.cat([kv_nope, kv_rope_rot], dim=-1)    # (seq, 1, head_dim)
-        # MLA: K == V
-        k_t = kv_full.transpose(0, 1)  # (1, seq, head_dim)
-        v_t = kv_full.transpose(0, 1)  # (1, seq, head_dim)
+        kv_full = torch.cat([kv_nope, kv_rope_rot], dim=-1).squeeze(1)  # (seq, head_dim)
+        kv_full = quantize_fp8_kv(kv_full, n_rot)
 
-        # ---- Dense causal attention ----
-        # Q: (n_head, seq, head_dim) for manual matmul
-        q_t = q_full.transpose(0, 1)  # (n_head, seq, head_dim)
-        scale = head_dim ** -0.5
-        # scores: (n_head, seq, seq)
-        scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * scale
-
-        # Causal mask
-        causal = torch.triu(
-            torch.full((seq, seq), float("-inf"), device=device, dtype=dtype),
-            diagonal=1,
-        )
-        scores = scores + causal
-
-        # The learned sink is a virtual zero-valued row: its logit participates
-        # in the softmax denominator but contributes no value vector.
-        sink_scores = self.sinks.float().reshape(n_head, 1, 1).expand(-1, seq, -1)
-        scores_with_sink = torch.cat([scores.float(), sink_scores], dim=-1)
-        weights = torch.softmax(scores_with_sink, dim=-1)[..., :seq].to(dtype)
-        attn_out = torch.matmul(weights, v_t)       # (n_head, seq, head_dim)
-        attn_out = attn_out.transpose(0, 1)          # (seq, n_head, head_dim)
+        # ---- Raw causal sliding-window attention (M9) ----
+        attn_out = raw_sliding_window_attention(
+            q_full, kv_full, self.sinks, self.cfg.n_swa
+        ).to(dtype)
 
         # ---- Inverse RoPE on output ----
         attn_nope = attn_out[..., :nope]             # (seq, n_head, nope)

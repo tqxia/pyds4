@@ -252,9 +252,14 @@ layers with `ratio=128` get two; layers with `ratio=0` get one.
 
 ### 5.1 Raw sliding-window
 
-The simplest path. The last `n_swa=128` KV rows are kept verbatim in a ring
-buffer. Standard causal attention over this window. This gives the model
-recent-context precision (grammar, local coherence).
+The raw path attends causally to at most `n_swa=128` recent KV rows. After
+tail RoPE, DS4 runs the 448-wide non-RoPE prefix through a block-scaled E4M3
+round trip (seven independent 64-value blocks); the 64-wide rotated tail is
+left in float. A learned sink logit contributes denominator mass but no value.
+
+During prefill, query `t` can see keys `k <= t` satisfying `t - k < 128`.
+Persistent ring-buffer storage for decode is separate from this prefill mask
+and is scheduled for M19.
 
 ### 5.2 HCA compressor (Heavily Compressed Attention)
 
@@ -408,9 +413,9 @@ Every attention-related tensor and its shape:
 | Milestone | Status | What it covers |
 |-----------|--------|----------------|
 | M7 | ✓ done | All attention parameters declared |
-| M8b | ✓ done | Dense causal MLA (Q/KV proj, RoPE, attention, grouped output) |
+| M8b | ✓ done | Initial dense causal MLA forward |
 | M8d | ✓ done | HC pre/post with Sinkhorn wrapping attention |
-| M9 | open | Raw sliding-window attention (ring buffer) |
+| M9 | ✓ done | Raw 128-token prefill window, E4M3 KV, YaRN, ds4 tap parity |
 | M10 | open | HCA compressor prefill + decode update |
 | M11 | open | CSA indexer scoring + top-K selection |
 | M12 | open | Mixed attention: raw + compressor + indexer in one call |

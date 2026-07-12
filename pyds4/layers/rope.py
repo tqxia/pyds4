@@ -8,20 +8,69 @@ ds4.c reference: `rope_tail_ext_inplace` (line 4787).
 
 from __future__ import annotations
 
+import math
+from typing import TYPE_CHECKING
+
 import torch
+
+if TYPE_CHECKING:
+    from pyds4.config import DS4Config
 
 
 def precompute_rope_freqs(
     n_rot: int,
     freq_base: float,
     device: torch.device | str,
+    *,
+    freq_scale: float = 1.0,
+    yarn_orig_ctx: int | None = None,
+    yarn_beta_fast: float = 32.0,
+    yarn_beta_slow: float = 1.0,
 ) -> torch.Tensor:
-    """Return inv_freq of shape (n_rot//2,).
+    """Return the effective frequency of each adjacent RoPE pair.
 
-    inv_freq[i] = freq_base ** (-2*i / n_rot)
+    With ``yarn_orig_ctx`` unset this is ordinary RoPE, optionally interpolated
+    by ``freq_scale``. With it set, reproduce ds4's YaRN interpolation ramp.
+    DS4 cancels YaRN's magnitude multiplier, so only the angle changes.
     """
     i = torch.arange(0, n_rot, 2, device=device, dtype=torch.float32)
-    return 1.0 / (freq_base ** (i / n_rot))
+    inv_freq = freq_base ** (-i / n_rot)
+    if yarn_orig_ctx is None:
+        return inv_freq * freq_scale
+
+    denom = 2.0 * math.log(freq_base)
+    low = math.floor(
+        n_rot * math.log(yarn_orig_ctx / (yarn_beta_fast * 2.0 * math.pi)) / denom
+    )
+    high = math.ceil(
+        n_rot * math.log(yarn_orig_ctx / (yarn_beta_slow * 2.0 * math.pi)) / denom
+    )
+    low = max(0.0, float(low))
+    high = min(float(n_rot - 1), float(high))
+    ramp = 1.0 - ((i / 2.0 - low) / max(0.001, high - low)).clamp(0.0, 1.0)
+    return inv_freq * (freq_scale * (1.0 - ramp) + ramp)
+
+
+def precompute_layer_rope_freqs(
+    cfg: "DS4Config",
+    ratio: int,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Return the exact RoPE frequencies selected by ds4 for one layer."""
+    if ratio == 0:
+        return precompute_rope_freqs(cfg.n_rot, cfg.rope_freq_base, device)
+
+    factor = cfg.yarn_factor
+    freq_scale = 1.0 / factor if factor > 0.0 else 1.0
+    return precompute_rope_freqs(
+        cfg.n_rot,
+        cfg.compress_rope_freq_base,
+        device,
+        freq_scale=freq_scale,
+        yarn_orig_ctx=cfg.yarn_orig_ctx if factor > 1.0 else None,
+        yarn_beta_fast=cfg.yarn_beta_fast,
+        yarn_beta_slow=cfg.yarn_beta_slow,
+    )
 
 
 def rope_forward(

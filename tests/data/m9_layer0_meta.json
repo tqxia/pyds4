@@ -1,0 +1,11 @@
+{
+  "source": "ds4 CUDA activation dump",
+  "command": "DS4_METAL_GRAPH_DUMP_NAME='attn_norm attn_out' DS4_METAL_GRAPH_DUMP_LAYER=0 DS4_METAL_GRAPH_DUMP_POS=0 ./ds4 -p 'Hello, world.' --cuda --nothink -n 1 -c 512 --temp 0",
+  "layer": 0,
+  "position": 0,
+  "sequence_length": 13,
+  "shape": [13, 4096],
+  "dtype": "float32",
+  "max_abs_diff_threshold": 0.05,
+  "mean_abs_diff_threshold": 0.005
+}

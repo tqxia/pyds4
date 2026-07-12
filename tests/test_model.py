@@ -345,8 +345,8 @@ def test_forward_m8d_hc_roundtrip() -> None:
 
 
 @gguf_available
-def test_forward_m8b_attention_one_block() -> None:
-    """M8b: attention forward for one block — shapes correct, output finite."""
+def test_forward_m9_attention_one_block_crosses_window() -> None:
+    """M9 integration: a real layer runs across the 128-token SWA cutoff."""
     with gguf.parse(GGUF_PATH) as g:
         cfg = DS4Config.from_gguf(g)
         model = DS4Model(cfg, device="meta")
@@ -364,9 +364,9 @@ def test_forward_m8b_attention_one_block() -> None:
     from pyds4.layers.rope import precompute_rope_freqs
     inv_freq = precompute_rope_freqs(cfg.n_rot, cfg.rope_freq_base, "cuda")
 
-    # 4-token sequence (dense causal)
-    x = torch.randn(4, cfg.n_embd, device="cuda", dtype=torch.bfloat16)
-    positions = torch.arange(4, device="cuda")
+    seq = cfg.n_swa + 1
+    x = torch.randn(seq, cfg.n_embd, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(seq, device="cuda")
 
     with torch.no_grad():
         out = model.blocks[0].attn.forward(
@@ -374,7 +374,7 @@ def test_forward_m8b_attention_one_block() -> None:
             cfg.n_head, cfg.head_dim, cfg.n_rot, cfg.out_group, cfg.lora_o,
         )
 
-    assert out.shape == (4, cfg.n_embd)
+    assert out.shape == (seq, cfg.n_embd)
     assert torch.isfinite(out).all()
     assert out.std().item() > 0.0
 

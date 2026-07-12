@@ -1,8 +1,8 @@
-"""DS4Model — top-level skeleton + GGUF weight loader + naive forward pass.
+"""DS4Model — top-level skeleton + GGUF weight loader + PyTorch forward pass.
 
-M7: `DS4Model.__init__` declares all parameters on `device='meta'`.
-M8: `DS4Model.forward()` runs the end-to-end pipeline using dense causal
-    attention (no CSA/HCA compressor/indexer), bf16 compute, PyTorch ops.
+M7: parameter skeleton and weight loader. M8: naive end-to-end forward.
+M9: raw 128-token sliding-window attention with DS4 cache quantization and
+    layer-specific RoPE. HCA/CSA remain pending.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from pyds4.layers import (
     RMSNorm,
 )
 from pyds4.layers.rms import rms_norm_weight
-from pyds4.layers.rope import precompute_rope_freqs
+from pyds4.layers.rope import precompute_layer_rope_freqs
 from pyds4.quant import dequant_iq2_xxs, dequant_q2_k, dequant_q8_0
 
 
@@ -153,9 +153,9 @@ class DS4Model(nn.Module):
         if positions is None:
             positions = torch.arange(seq, device=device)
 
-        # RoPE frequencies (same across layers; compressed layers differ but
-        # ds4 applies a freq_scale, handled in M9+).
-        inv_freq = precompute_rope_freqs(cfg.n_rot, cfg.rope_freq_base, device)
+        # Dense and compressed layers use different base/YaRN frequencies.
+        raw_inv_freq = precompute_layer_rope_freqs(cfg, 0, device)
+        compressed_inv_freq = precompute_layer_rope_freqs(cfg, 4, device)
 
         # Token embedding: token_embd has shape (n_embd, vocab_size).
         # embed[:, tok] gives (n_embd, seq) → transpose to (seq, n_embd).
@@ -166,6 +166,7 @@ class DS4Model(nn.Module):
 
         # Process each block
         for block in self.blocks:
+            inv_freq = compressed_inv_freq if block.ratio else raw_inv_freq
             hc_state = block(
                 hc_state,
                 positions,

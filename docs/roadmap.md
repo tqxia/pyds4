@@ -93,8 +93,8 @@ three formats cover every quantized tensor in ds4flash.gguf; everything else
 
 ## Phase C — Naive forward pass (PyTorch, bf16, no Triton, no sparsity)
 
-End-to-end code path exists. **Logit parity is not yet expected** — we're
-using dense causal attention as a stand-in for CSA + HCA.
+End-to-end code path exists. **Logit parity is not yet expected** — after M9
+the raw sliding window is real, while CSA + HCA are still absent.
 
 ### M7. Model skeleton — **done** (`bb41b5f`)
 - **Goal:** `DS4Model.__init__` builds all layer parameters and loads weights
@@ -142,14 +142,20 @@ using dense causal attention as a stand-in for CSA + HCA.
 
 ## Phase D — Real attention (logit parity goal)
 
-Swap dense attention for ds4's actual three-path attention. Per-layer
-parity is checked through a temporary `DS4T_TAP=<name>` instrumentation hook
-in the ds4 reference (scratch-only, not committed upstream).
+Replace the naive attention stand-in with ds4's actual three-path attention.
+Per-layer parity uses ds4's `DS4_METAL_GRAPH_DUMP_*` activation hooks.
 
-### M9. Raw sliding-window attention — **open**
-- **Goal:** the "raw" KV path — last N tokens kept verbatim, attended with a
-  sliding-window mask.
-- **Oracle:** per-layer activation tap vs ds4.
+### M9. Raw sliding-window attention — **done**
+- **Goal:** implement the raw prefill path: layer-specific RoPE/YaRN, the
+  block-scaled E4M3 round trip on the non-RoPE KV prefix, a causal 128-token
+  mask, virtual-sink normalization, inverse RoPE, and grouped output.
+- **Artifact:** `quantize_fp8_kv`, `raw_sliding_window_attention`, and the M9
+  path in `Attention.forward`; persistent decode ring storage remains M19.
+- **Oracle:** scalar translations of ds4's E4M3 and raw-row attention formulas
+  are covered in `tests/test_attention.py`. A real layer-0 CUDA activation tap
+  on a 13-token prompt replays with max-abs-diff **0.04263** and mean-abs-diff
+  **0.00424** (`test_layer0_attention_matches_ds4_activation_tap`). A real
+  129-token layer test crosses the `n_swa=128` boundary.
 
 ### M10. Compressor (HCA) prefill — **open**
 - **Goal:** Heavily-Compressed Attention. Build the ratio-4 pooled view of
