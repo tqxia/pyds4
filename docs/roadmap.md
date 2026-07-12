@@ -157,11 +157,18 @@ Per-layer parity uses ds4's `DS4_METAL_GRAPH_DUMP_*` activation hooks.
   **0.00424** (`test_layer0_attention_matches_ds4_activation_tap`). A real
   129-token layer test crosses the `n_swa=128` boundary.
 
-### M10. Compressor (HCA) prefill — **open**
-- **Goal:** Heavily-Compressed Attention. Build the ratio-4 pooled view of
-  the long past from the full prompt; store frontier compressor states.
-- **Oracle:** per-layer compressed-K / compressed-V tensors match ds4
-  layer-by-layer.
+### M10. Compressor (HCA) prefill — **done**
+- **Goal:** project full-prompt KV/score lanes, add phase-dependent APE, pool
+  ratio-4 and ratio-128 blocks per feature, normalize/rotate/E4M3-round the
+  compressed rows, and return the exact CUDA decode frontier plus per-token
+  compressed-row counts. Mixed attention remains M12.
+- **Artifact:** `Compressor.prefill`, `compressor_prefill_from_projected`, and
+  `CompressorPrefillOutput` in `pyds4/layers/attention.py`.
+- **Oracle:** scalar ratio-128 pooling/frontier coverage plus CUDA activation
+  taps for both layouts. Layer 2 (ratio 4) matches compressed rows at max
+  **0.0625**, mean **7.8e-05**; frontier KV/score max errors are **7.6e-05**
+  and **3.1e-04**. Layer 3 (ratio 128) matches rows at max **1.03e-04**,
+  mean **8.2e-07**; frontier masks are exact.
 
 ### M11. Indexer (CSA) prefill — **open**
 - **Goal:** Compressed-Sparse Attention indexer — score every past compressor

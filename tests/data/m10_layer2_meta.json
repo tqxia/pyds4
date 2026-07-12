@@ -1,0 +1,13 @@
+{
+  "source": "ds4 CUDA activation dump",
+  "command": "DS4_METAL_GRAPH_DUMP_NAME='attn_norm KVcompress attn_state_kv attn_state_score' DS4_METAL_GRAPH_DUMP_LAYER=2 DS4_METAL_GRAPH_DUMP_POS=0 ./ds4 -p 'Hello, world.' --cuda --nothink -n 1 -c 512 --temp 0",
+  "layer": 2,
+  "ratio": 4,
+  "position": 0,
+  "sequence_length": 13,
+  "compressed_shape": [3, 512],
+  "state_shape": [8, 1024],
+  "dtype": "float32",
+  "compressed_max_abs_diff_threshold": 0.07,
+  "compressed_mean_abs_diff_threshold": 0.0001
+}

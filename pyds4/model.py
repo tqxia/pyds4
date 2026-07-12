@@ -2,7 +2,7 @@
 
 M7: parameter skeleton and weight loader. M8: naive end-to-end forward.
 M9: raw 128-token sliding-window attention with DS4 cache quantization and
-    layer-specific RoPE. HCA/CSA remain pending.
+    layer-specific RoPE. M10 adds HCA prefill; CSA/mixed attention remain pending.
 """
 
 from __future__ import annotations

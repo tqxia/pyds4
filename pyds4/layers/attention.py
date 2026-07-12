@@ -30,15 +30,17 @@ DeepSeek V4 Flash has three attention paths that read the same KV cache:
        indexer_compressor_gate: (n_embd, 2*ix_hdim)      F16
        indexer_compressor_ape:  (2*ix_hdim, 4)           F16
 
-M9 implements the raw MLA path: layer-specific RoPE, DS4's E4M3 cache
-round-trip, sink-aware causal sliding-window attention, inverse RoPE, and the
-grouped output projection. Compressor and Indexer forward paths land in M10/M11.
+M9 implements the raw MLA path. M10 adds ratio-4/128 HCA compressor prefill
+and exact decode-frontier construction. The CSA indexer lands in M11; combining
+raw and compressed rows in the attention softmax remains M12.
 
 Shape conventions match the GGUF tensor descs verbatim so the
 GGUF→model weight loader is an identity on shape.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -139,8 +141,107 @@ def raw_sliding_window_attention(
     return torch.matmul(real_probabilities, kv.float().unsqueeze(0)).transpose(0, 1)
 
 
+@dataclass(frozen=True)
+class CompressorPrefillOutput:
+    """Compressed rows plus the decode frontier left after prompt prefill."""
+
+    rows: torch.Tensor
+    state_kv: torch.Tensor
+    state_score: torch.Tensor
+    counts: torch.Tensor
+
+
+def compressor_prefill_from_projected(
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    ape: torch.Tensor,
+    norm: torch.Tensor,
+    *,
+    ratio: int,
+    positions: torch.Tensor,
+    inv_freq: torch.Tensor,
+    n_rot: int,
+    rms_eps: float,
+) -> CompressorPrefillOutput:
+    """Pool projected HCA rows and construct ds4's post-prefill frontier."""
+    if ratio not in (4, 128):
+        raise ValueError("HCA compressor ratio must be 4 or 128")
+    if kv.shape != score.shape or kv.ndim != 2:
+        raise ValueError("compressor kv and score must be equal 2-D tensors")
+
+    seq, width = kv.shape
+    coff = 2 if ratio == 4 else 1
+    if width % coff != 0:
+        raise ValueError("compressor width is incompatible with its ratio")
+    head_dim = width // coff
+    if ape.shape != (width, ratio):
+        raise ValueError(f"expected APE shape {(width, ratio)}, got {tuple(ape.shape)}")
+    if norm.shape != (head_dim,):
+        raise ValueError(f"expected norm shape {(head_dim,)}, got {tuple(norm.shape)}")
+    if positions.shape != (seq,):
+        raise ValueError(f"expected positions shape {(seq,)}, got {tuple(positions.shape)}")
+    if seq > 1 and not torch.all(positions[1:] == positions[:-1] + 1):
+        raise ValueError("compressor prefill positions must be contiguous")
+
+    kv_f32 = kv.float()
+    phase = positions.remainder(ratio).long()
+    score_f32 = score.float() + ape.float()[:, phase].T
+    n_comp = seq // ratio
+    cutoff = n_comp * ratio
+
+    if n_comp == 0:
+        pooled = kv_f32.new_empty((0, head_dim))
+    elif ratio == 4:
+        blocks_kv = kv_f32[:cutoff].reshape(n_comp, ratio, width)
+        blocks_score = score_f32[:cutoff].reshape(n_comp, ratio, width)
+        values = kv_f32.new_zeros((n_comp, 2 * ratio, head_dim))
+        scores = kv_f32.new_full((n_comp, 2 * ratio, head_dim), float("-inf"))
+        values[:, ratio:] = blocks_kv[:, :, head_dim:]
+        scores[:, ratio:] = blocks_score[:, :, head_dim:]
+        if n_comp > 1:
+            values[1:, :ratio] = blocks_kv[:-1, :, :head_dim]
+            scores[1:, :ratio] = blocks_score[:-1, :, :head_dim]
+        weights = torch.softmax(scores, dim=1)
+        pooled = (weights * values).sum(dim=1)
+    else:
+        values = kv_f32[:cutoff, :head_dim].reshape(n_comp, ratio, head_dim)
+        scores = score_f32[:cutoff, :head_dim].reshape(n_comp, ratio, head_dim)
+        pooled = (torch.softmax(scores, dim=1) * values).sum(dim=1)
+
+    rows = rms_norm_weight(pooled, norm.float(), rms_eps)
+    if n_comp:
+        comp_positions = positions[:cutoff:ratio]
+        nope = head_dim - n_rot
+        rotated = rope_forward(rows[:, nope:], comp_positions, inv_freq)
+        rows = torch.cat([rows[:, :nope], rotated], dim=-1)
+        rows = quantize_fp8_kv(rows, n_rot)
+
+    state_rows = coff * ratio
+    state_kv = kv_f32.new_zeros((state_rows, width))
+    state_score = kv_f32.new_full((state_rows, width), float("-inf"))
+    remainder = seq - cutoff
+    if ratio == 4:
+        if seq >= ratio:
+            # The CUDA release path replays the last four projections with the
+            # small-batch kernel, placing them in the primary frontier lane.
+            state_kv[:ratio] = kv_f32[-ratio:]
+            state_score[:ratio] = score_f32[-ratio:]
+        elif seq:
+            frontier_rows = ratio + phase
+            state_kv[frontier_rows] = kv_f32
+            state_score[frontier_rows] = score_f32
+    elif remainder:
+        state_kv[:remainder] = kv_f32[cutoff:]
+        state_score[:remainder] = score_f32[cutoff:]
+
+    counts = torch.arange(1, seq + 1, device=kv.device).div(
+        ratio, rounding_mode="floor"
+    )
+    return CompressorPrefillOutput(rows, state_kv, state_score, counts)
+
+
 class Compressor(nn.Module):
-    """HCA compressor — 4 parameters (norm, kv, gate, ape)."""
+    """HCA compressor parameters plus M10 prompt-prefill implementation."""
 
     def __init__(
         self,
@@ -152,6 +253,9 @@ class Compressor(nn.Module):
         device: torch.device | str | None = "meta",
     ) -> None:
         super().__init__()
+        self.head_dim = head_dim
+        self.comp_width = comp_width
+        self.ratio = ape_ratio
         self.norm = nn.Parameter(
             torch.empty(head_dim, device=device, dtype=torch.float32),
             requires_grad=False,
@@ -167,6 +271,33 @@ class Compressor(nn.Module):
         self.ape = nn.Parameter(
             torch.empty(comp_width, ape_ratio, device=device, dtype=torch.float16),
             requires_grad=False,
+        )
+
+    def prefill(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        inv_freq: torch.Tensor,
+        *,
+        n_rot: int,
+        rms_eps: float,
+    ) -> CompressorPrefillOutput:
+        """Project a prompt and build HCA rows plus the decode frontier."""
+        if self.head_dim != 512:
+            raise ValueError("M10 HCA prefill expects the 512-wide attention compressor")
+        dtype = x.dtype
+        kv = torch.matmul(x, self.kv.to(dtype))
+        score = torch.matmul(x, self.gate.to(dtype))
+        return compressor_prefill_from_projected(
+            kv,
+            score,
+            self.ape,
+            self.norm,
+            ratio=self.ratio,
+            positions=positions,
+            inv_freq=inv_freq,
+            n_rot=n_rot,
+            rms_eps=rms_eps,
         )
 
 
@@ -201,10 +332,10 @@ class Indexer(nn.Module):
 
 
 class Attention(nn.Module):
-    """Per-layer attention with the M9 raw sliding-window MLA path.
+    """Per-layer raw attention plus optional HCA/CSA components.
 
-    Compressor and indexer parameters are declared; their forward paths are
-    added by M10 and M11.
+    M10 compressor prefill is available through ``self.compressor.prefill``.
+    The indexer and mixed-attention path land in M11 and M12.
     """
 
     def __init__(

@@ -4,7 +4,13 @@ M7 scope: parameter declarations only.
 M8 scope: forward methods on every module.
 """
 
-from pyds4.layers.attention import Attention, Compressor, Indexer
+from pyds4.layers.attention import (
+    Attention,
+    Compressor,
+    CompressorPrefillOutput,
+    Indexer,
+    compressor_prefill_from_projected,
+)
 from pyds4.layers.hc import HyperConnections, OutputHC
 from pyds4.layers.moe import MoEFFN
 from pyds4.layers.rms import RMSNorm, rms_norm_no_weight, rms_norm_weight
@@ -18,6 +24,8 @@ from pyds4.layers.rope import (
 __all__ = [
     "Attention",
     "Compressor",
+    "CompressorPrefillOutput",
+    "compressor_prefill_from_projected",
     "HyperConnections",
     "Indexer",
     "MoEFFN",

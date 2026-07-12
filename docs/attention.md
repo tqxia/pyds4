@@ -263,21 +263,22 @@ and is scheduled for M19.
 
 ### 5.2 HCA compressor (Heavily Compressed Attention)
 
-A compressor pool maintains a **ratio-4 or ratio-128** view of the long past.
-For each block of `ratio` tokens, a learned projection compresses them into
-one compressed KV row. The compressor uses its own KV projections
-(`attn_compressor_*` tensors) and a gate mechanism to decide how much
-of the new information to absorb.
+The compressor projects every normalized token into a KV lane and a score
+lane, adds an absolute-phase embedding (APE) to the scores, then performs a
+separate softmax across candidate tokens for every one of the 512 features.
 
-For `ratio=4`: each 4-token block → 1 compressed row. The compressor width
-is `2 × head_dim = 1024` (wider to capture more per-row).
+For `ratio=4`, the projection width is `2 × head_dim = 1024`. Compressed row
+zero pools four lane-1 candidates from tokens 0–3. Later row `c` pools eight
+candidates: lane 0 from block `c-1` and lane 1 from block `c`. This overlapping
+two-lane design preserves more local information than ordinary 4:1 pooling.
 
-For `ratio=128`: each 128-token block → 1 compressed row. The compressor
-width is `1 × head_dim = 512`.
+For `ratio=128`, the width is 512 and each row independently pools one
+128-token block. Both layouts then apply learned RMSNorm, layer-specific tail
+RoPE, and the same E4M3 round trip as raw KV.
 
-The compressor runs at **decode time** too: as new tokens arrive, they're
-accumulated, and when `ratio` tokens fill a block, the compressor pool is
-updated with a new row.
+Prefill also returns the CUDA-compatible frontier (`state_kv`, `state_score`)
+needed by a later decode loop. Ratio-4 CUDA rebuilds its primary frontier lane
+from the last four prompt projections; ratio-128 retains the incomplete tail.
 
 ### 5.3 CSA indexer (Compressed Sparse Attention)
 
@@ -416,6 +417,6 @@ Every attention-related tensor and its shape:
 | M8b | ✓ done | Initial dense causal MLA forward |
 | M8d | ✓ done | HC pre/post with Sinkhorn wrapping attention |
 | M9 | ✓ done | Raw 128-token prefill window, E4M3 KV, YaRN, ds4 tap parity |
-| M10 | open | HCA compressor prefill + decode update |
+| M10 | ✓ done | Ratio-4/128 HCA rows + CUDA-compatible decode frontier |
 | M11 | open | CSA indexer scoring + top-K selection |
 | M12 | open | Mixed attention: raw + compressor + indexer in one call |
