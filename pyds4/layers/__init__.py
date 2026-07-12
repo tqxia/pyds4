@@ -1,20 +1,14 @@
 """DS4 layer modules.
 
-M7 scope: parameter declarations only. No forward methods — those land in M8.
-Every leaf tensor on a layer is an `nn.Parameter` whose shape matches the
-corresponding GGUF tensor *exactly* (no transposes). This makes the
-GGUF→model name map an identity on shape and lets the M7 test check
-parameter-count parity by summing `numel()` over `model.state_dict()`.
-
-Modules default to `device='meta'` so instantiation is essentially free
-(only shape metadata is allocated). The weight loader in `pyds4.model`
-materializes parameters from GGUF tensor bytes when called.
+M7 scope: parameter declarations only.
+M8 scope: forward methods on every module.
 """
 
 from pyds4.layers.attention import Attention, Compressor, Indexer
 from pyds4.layers.hc import HyperConnections, OutputHC
 from pyds4.layers.moe import MoEFFN
-from pyds4.layers.rms import RMSNorm
+from pyds4.layers.rms import RMSNorm, rms_norm_no_weight, rms_norm_weight
+from pyds4.layers.rope import precompute_rope_freqs, rope_forward, rope_inverse
 
 __all__ = [
     "Attention",
@@ -24,4 +18,9 @@ __all__ = [
     "MoEFFN",
     "OutputHC",
     "RMSNorm",
+    "precompute_rope_freqs",
+    "rms_norm_no_weight",
+    "rms_norm_weight",
+    "rope_forward",
+    "rope_inverse",
 ]

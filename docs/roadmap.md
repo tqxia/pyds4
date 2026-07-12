@@ -120,19 +120,23 @@ using dense causal attention as a stand-in for CSA + HCA.
   partial `load_weights` smoke test loads 43 `attn_norm` tensors to CPU
   fp32 and verifies plausible DS4 pre-norm gain statistics.
 
-### M8. Forward pass, naive — **open** (five sub-milestones)
-- **M8a.** Token embedding (HC space) + final norm + LM head. Forward a
-  1-token prompt; logits are garbage but **shapes must be right**.
-- **M8b.** One transformer block with **dense causal attention** (Q/K/V
-  projections, scaled dot-product, RoPE on the rotated tail).
-- **M8c.** MoE FFN: router (top-K softmax/sigmoid), routed experts + shared
-  experts, SwiGLU, weighted combine.
-- **M8d.** Hyper-connection split/expand (mHC). Residual stream goes from
-  `[seq, d]` to `[seq, n_hc, d]`; layers communicate via Sinkhorn-normalized
-  mixing.
-- **M8e.** Stack all layers. Forward a 20-token prompt — the run completes
-  and produces a plausible distribution (top-K isn't garbage). **No parity
-  yet.**
+### M8. Forward pass, naive — **done**
+- **M8a.** Token embedding in HC space, output-HC collapse, final RMSNorm,
+  and LM head produce finite logits with the expected shape.
+- **M8b.** Dense causal MLA implements Q/KV projection, tail RoPE, sink-aware
+  softmax, inverse RoPE, and grouped output projection.
+- **M8c.** MoE implements token-hash selection for layers 0–2, biased top-K
+  thereafter, normalized route weights, lazy expert dequant, shared experts,
+  and ds4-compatible SwiGLU.
+- **M8d.** Hyper-connections carry `[seq, n_hc, d]` state through fp32
+  Sinkhorn mixing around attention and FFN.
+- **M8e.** The full 43-layer stack ran against the real 81 GB GGUF on a fixed
+  20-token prompt. The 2026-07-11 validation loaded 1,199 non-expert tensors,
+  streamed routed experts from mmap, completed the forward in **259.3 s**,
+  produced finite `(20, 129280)` logits, and returned **18 distinct argmax
+  tokens**. The opt-in oracle `PYDS4_RUN_M8E=1 pytest
+  tests/test_model.py::test_forward_m8e_full_20_tokens -s` passed. Logit
+  parity remains intentionally deferred to M12.
 
 ---
 

@@ -30,7 +30,9 @@ DeepSeek V4 Flash has three attention paths that read the same KV cache:
        indexer_compressor_gate: (n_embd, 2*ix_hdim)      F16
        indexer_compressor_ape:  (2*ix_hdim, 4)           F16
 
-`ratio` is the per-layer compress ratio from cfg.compress_ratios.
+M8 forward uses only the main MLA path with dense causal attention.
+Compressor and Indexer are declared as parameters but forward() is a no-op
+for now (landing in M9/M10).
 
 Shape conventions match the GGUF tensor descs verbatim so the
 GGUF→model weight loader is an identity on shape.
@@ -42,6 +44,8 @@ import torch
 from torch import nn
 
 from pyds4.config import DS4Config
+from pyds4.layers.rms import rms_norm_no_weight, rms_norm_weight
+from pyds4.layers.rope import rope_forward, rope_inverse
 
 
 def _compressor_width(cfg: DS4Config, ratio: int) -> int:
@@ -112,7 +116,10 @@ class Indexer(nn.Module):
 
 
 class Attention(nn.Module):
-    """Per-layer attention parameters: main MLA + optional compressor + optional indexer."""
+    """Per-layer attention: main MLA path with dense causal attention.
+
+    M8: dense causal only. Compressor/Indexer forward lands in M9/M10.
+    """
 
     def __init__(
         self,
@@ -122,15 +129,11 @@ class Attention(nn.Module):
         device: torch.device | str | None = "meta",
     ) -> None:
         super().__init__()
+        self.cfg = cfg
         self.ratio = ratio
 
         # ds4.c: attn_output_a shape = (head_dim * (n_head / out_group), lora_o).
-        # 512 * (64/8) = 512 * 8 = 4096... wait that's not 4096; it's 64/8=8 so
-        # 512*8 = 4096. GGUF says (4096, 8192). The 8192 is lora_o? No, lora_o=1024.
-        # Actually the GGUF shape (4096, 8192) tells us:
-        #   in_dim=4096 = head_dim*n_head/out_group  ✓
-        #   out_dim=8192 = lora_o*n_hc? Or just an output low rank dim.
-        # ds4.c calls this `out_low_dim`; in the model that's 8*lora_o = 8192.
+        # 512 * (64/8) = 512 * 8 = 4096. The output is 8 * lora_o = 8192.
         # We bake the shape in from the GGUF, no need to re-derive symbolically.
         attn_out_a_in = cfg.head_dim * (cfg.n_head // cfg.out_group)  # 4096
         attn_out_a_out = 8 * cfg.lora_o                               # 8192  (matches GGUF)
@@ -183,3 +186,111 @@ class Attention(nn.Module):
             )
         if ratio == 4:
             self.indexer = Indexer(cfg, device=device)
+
+    # ------------------------------------------------------------------
+    # Forward — dense causal MLA attention (M8b)
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        inv_freq: torch.Tensor,
+        n_head: int,
+        head_dim: int,
+        n_rot: int,
+        out_group: int,
+        lora_o: int,
+    ) -> torch.Tensor:
+        """Dense causal self-attention (MLA-style, no compressor/indexer).
+
+        x:         (seq, n_embd) — pre-RMS-normed input
+        positions: (seq,)        — position IDs
+        inv_freq:  (n_rot//2,)   — precomputed RoPE frequencies
+        Returns:   (seq, n_embd) — attention output (pre-HC-post)
+        """
+        seq = x.shape[0]
+        device = x.device
+        dtype = x.dtype
+        nope = head_dim - n_rot  # 448
+
+        # ---- Q projection (MLA low-rank) ----
+        # x: (seq, n_embd) @ q_a: (n_embd, lora_q) → qr: (seq, lora_q)
+        qr = torch.matmul(x, self.q_a.to(dtype))
+        qr = rms_norm_weight(qr, self.q_a_norm.to(dtype), self.cfg.rms_eps)
+        # qr: (seq, lora_q) @ q_b: (lora_q, n_head*head_dim) → q: (seq, n_head*head_dim)
+        q = torch.matmul(qr, self.q_b.to(dtype))
+        q = q.reshape(seq, n_head, head_dim)
+        # Per-head RMSNorm (no learned weight) — ds4.c line 7977
+        q = rms_norm_no_weight(q, self.cfg.rms_eps)
+
+        # ---- KV projection (MLA shared, 1 KV head) ----
+        # x: (seq, n_embd) @ kv: (n_embd, head_dim) → kv: (seq, head_dim)
+        kv = torch.matmul(x, self.kv.to(dtype))
+        kv = rms_norm_weight(kv, self.kv_a_norm.to(dtype), self.cfg.rms_eps)
+        kv = kv.unsqueeze(1)  # (seq, 1, head_dim) — 1 KV head
+
+        # ---- Split no-pe / rope ----
+        q_nope = q[..., :nope]   # (seq, n_head, nope)
+        q_rope = q[..., nope:]   # (seq, n_head, n_rot)
+        kv_nope = kv[..., :nope]  # (seq, 1, nope)
+        kv_rope = kv[..., nope:]  # (seq, 1, n_rot)
+
+        # ---- RoPE (forward on Q and K) ----
+        q_rope_flat = q_rope.reshape(-1, n_rot)     # (seq*n_head, n_rot)
+        q_pos = positions.repeat_interleave(n_head)  # (seq*n_head,)
+        q_rope_rot = rope_forward(q_rope_flat, q_pos, inv_freq).reshape(seq, n_head, n_rot)
+
+        kv_rope_rot = rope_forward(
+            kv_rope.reshape(-1, n_rot), positions, inv_freq
+        ).reshape(seq, 1, n_rot)
+
+        # Recombine
+        q_full = torch.cat([q_nope, q_rope_rot], dim=-1)       # (seq, n_head, head_dim)
+        kv_full = torch.cat([kv_nope, kv_rope_rot], dim=-1)    # (seq, 1, head_dim)
+        # MLA: K == V
+        k_t = kv_full.transpose(0, 1)  # (1, seq, head_dim)
+        v_t = kv_full.transpose(0, 1)  # (1, seq, head_dim)
+
+        # ---- Dense causal attention ----
+        # Q: (n_head, seq, head_dim) for manual matmul
+        q_t = q_full.transpose(0, 1)  # (n_head, seq, head_dim)
+        scale = head_dim ** -0.5
+        # scores: (n_head, seq, seq)
+        scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * scale
+
+        # Causal mask
+        causal = torch.triu(
+            torch.full((seq, seq), float("-inf"), device=device, dtype=dtype),
+            diagonal=1,
+        )
+        scores = scores + causal
+
+        # The learned sink is a virtual zero-valued row: its logit participates
+        # in the softmax denominator but contributes no value vector.
+        sink_scores = self.sinks.float().reshape(n_head, 1, 1).expand(-1, seq, -1)
+        scores_with_sink = torch.cat([scores.float(), sink_scores], dim=-1)
+        weights = torch.softmax(scores_with_sink, dim=-1)[..., :seq].to(dtype)
+        attn_out = torch.matmul(weights, v_t)       # (n_head, seq, head_dim)
+        attn_out = attn_out.transpose(0, 1)          # (seq, n_head, head_dim)
+
+        # ---- Inverse RoPE on output ----
+        attn_nope = attn_out[..., :nope]             # (seq, n_head, nope)
+        attn_rope = attn_out[..., nope:]             # (seq, n_head, n_rot)
+        attn_rope_flat = attn_rope.reshape(-1, n_rot)
+        attn_rope_inv = rope_inverse(attn_rope_flat, q_pos, inv_freq).reshape(seq, n_head, n_rot)
+        attn_full = torch.cat([attn_nope, attn_rope_inv], dim=-1)  # (seq, n_head, head_dim)
+
+        # ---- Grouped output projection ----
+        attn_flat = attn_full.reshape(seq, n_head * head_dim)  # (seq, 32768)
+        chunk_size = head_dim * n_head // out_group            # 4096
+        low_parts = []
+        out_a = self.output_a.to(dtype)
+        for g in range(out_group):
+            group = attn_flat[:, g * chunk_size : (g + 1) * chunk_size]  # (seq, 4096)
+            slice_w = out_a[:, g * lora_o : (g + 1) * lora_o]            # (4096, 1024)
+            low_g = torch.matmul(group, slice_w)  # (seq, 1024)
+            low_parts.append(low_g)
+        low = torch.cat(low_parts, dim=-1)  # (seq, 8192)
+        out = torch.matmul(low, self.output_b.to(dtype))  # (seq, 8192) @ (8192, 4096) = (seq, 4096)
+        return out

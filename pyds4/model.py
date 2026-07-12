@@ -1,36 +1,14 @@
-"""DS4Model — top-level skeleton + GGUF weight loader.
+"""DS4Model — top-level skeleton + GGUF weight loader + naive forward pass.
 
-M7 deliverable: instantiation succeeds + parameter count matches the number
-ds4's `model_summary` reports. The number is just
-`sum(t.n_elements for t in gguf.tensors.values())`, since ds4 counts every
-tensor (including the I32 hash routing tables) as a logical parameter.
-
-`DS4Model.__init__` defaults to `device='meta'`, so building the full
-43-layer 284B-parameter graph allocates only shape metadata. To actually
-populate weights, call `model.load_weights(gguf_file, device=..., dtype=...)`
-— this materializes parameters on a real device and copies dequanted bytes
-in. For the 81 GB GGUF that's >280 GB of data even at fp16, so most callers
-will want to load a subset (e.g. for testing) or stream weights to GPU as
-needed in later milestones.
-
-Layer-presence rules (see ds4.c, line 2408 onward):
-
-  - compress_ratio == 0 (layers 0, 1): main attention only, no compressor,
-    no indexer.
-  - compress_ratio == 4 (layers 2, 4, ..., 42): main attention + compressor
-    + indexer (CSA path).
-  - compress_ratio == 128 (layers 3, 5, ..., 41): main attention +
-    compressor only (HCA, no CSA).
-  - layer < n_hash_layer (= 3): hash-routed FFN — carries `ffn_gate_tid2eid`
-    but NOT `exp_probs_b`. Layer 2 is the boundary and carries both gate_inp
-    AND the hash table.
-  - layer >= n_hash_layer: learned routing — carries `exp_probs_b.bias`.
+M7: `DS4Model.__init__` declares all parameters on `device='meta'`.
+M8: `DS4Model.forward()` runs the end-to-end pipeline using dense causal
+    attention (no CSA/HCA compressor/indexer), bf16 compute, PyTorch ops.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -45,6 +23,8 @@ from pyds4.layers import (
     OutputHC,
     RMSNorm,
 )
+from pyds4.layers.rms import rms_norm_weight
+from pyds4.layers.rope import precompute_rope_freqs
 from pyds4.quant import dequant_iq2_xxs, dequant_q2_k, dequant_q8_0
 
 
@@ -54,7 +34,7 @@ from pyds4.quant import dequant_iq2_xxs, dequant_q2_k, dequant_q8_0
 
 
 class DS4Block(nn.Module):
-    """One transformer layer. Sub-modules depend on layer index (see file docstring)."""
+    """One transformer layer: HC pre → Attn → HC post → HC pre → FFN → HC post."""
 
     def __init__(
         self,
@@ -65,6 +45,7 @@ class DS4Block(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.cfg = cfg
         self.ratio = cfg.compress_ratios[layer_idx]
 
         self.hc_attn = HyperConnections(cfg.n_embd, cfg.n_hc, device=device)
@@ -77,9 +58,47 @@ class DS4Block(nn.Module):
             device=device,
         )
 
+    def forward(
+        self,
+        hc_state: torch.Tensor,
+        positions: torch.Tensor,
+        inv_freq: torch.Tensor,
+        token_ids: Optional[torch.Tensor] = None,
+        expert_load_fn: Optional[Callable] = None,
+    ) -> torch.Tensor:
+        """hc_state: (seq, n_hc, n_embd), positions: (seq,). Returns (seq, n_hc, n_embd)."""
+        cfg = self.cfg
+
+        # ---- Attention sub-layer ----
+        x_attn_in, post_attn, comb_attn = self.hc_attn.forward_pre(
+            hc_state, cfg.rms_eps, cfg.hc_eps, cfg.sinkhorn_iters,
+        )
+        x_attn_norm = rms_norm_weight(x_attn_in, self.attn.norm, cfg.rms_eps)
+        attn_out = self.attn.forward(
+            x_attn_norm, positions, inv_freq,
+            cfg.n_head, cfg.head_dim, cfg.n_rot, cfg.out_group, cfg.lora_o,
+        )
+        hc_state = self.hc_attn.forward_post(attn_out, hc_state, post_attn, comb_attn)
+
+        # ---- FFN sub-layer ----
+        x_ffn_in, post_ffn, comb_ffn = self.hc_ffn.forward_pre(
+            hc_state, cfg.rms_eps, cfg.hc_eps, cfg.sinkhorn_iters,
+        )
+        x_ffn_norm = rms_norm_weight(x_ffn_in, self.ffn.norm, cfg.rms_eps)
+        ffn_out = self.ffn.forward(
+            x_ffn_norm, cfg.expert_weights_scale,
+            float(cfg.swiglu_clamp_exp[self.layer_idx]),
+            token_ids=token_ids,
+            expert_load_fn=(lambda eid: expert_load_fn(self.layer_idx, eid))
+            if expert_load_fn is not None else None,
+        )
+        hc_state = self.hc_ffn.forward_post(ffn_out, hc_state, post_ffn, comb_ffn)
+
+        return hc_state
+
 
 class DS4Model(nn.Module):
-    """The whole network. M7 = parameters only; forward() lands in M8."""
+    """The whole network."""
 
     def __init__(
         self,
@@ -108,9 +127,66 @@ class DS4Model(nn.Module):
         )
         self.output_hc = OutputHC(cfg.n_embd, cfg.n_hc, device=device)
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # Forward pass
+    # -------------------------------------------------------------------
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+        expert_load_fn: Optional[Callable] = None,
+    ) -> torch.Tensor:
+        """Full forward pass.
+
+        tokens: (seq,) int64 token IDs
+        positions: (seq,) or None (defaults to arange(seq))
+        expert_load_fn: callable(layer_idx, expert_id) -> (gate_w, up_w, down_w)
+            for lazy expert dequant. If None, experts must be pre-loaded as
+            nn.Parameters.
+        Returns: (seq, vocab_size) — logits
+        """
+        seq = tokens.shape[0]
+        device = tokens.device
+        cfg = self.cfg
+
+        if positions is None:
+            positions = torch.arange(seq, device=device)
+
+        # RoPE frequencies (same across layers; compressed layers differ but
+        # ds4 applies a freq_scale, handled in M9+).
+        inv_freq = precompute_rope_freqs(cfg.n_rot, cfg.rope_freq_base, device)
+
+        # Token embedding: token_embd has shape (n_embd, vocab_size).
+        # embed[:, tok] gives (n_embd, seq) → transpose to (seq, n_embd).
+        x = self.token_embd[:, tokens].T  # (seq, n_embd)
+
+        # Expand to n_hc identical streams
+        hc_state = x.unsqueeze(1).expand(-1, cfg.n_hc, -1)  # (seq, n_hc, n_embd)
+
+        # Process each block
+        for block in self.blocks:
+            hc_state = block(
+                hc_state,
+                positions,
+                inv_freq,
+                token_ids=tokens,
+                expert_load_fn=expert_load_fn,
+            )
+
+        # Output HC collapse: (seq, n_hc, n_embd) → (seq, n_embd)
+        x = self.output_hc.forward(hc_state, cfg.rms_eps, cfg.hc_eps)
+
+        # Final RMSNorm
+        x = rms_norm_weight(x, self.output_norm.weight, cfg.rms_eps)
+
+        # LM head: (seq, n_embd) @ (n_embd, vocab_size) → (seq, vocab_size)
+        logits = torch.matmul(x, self.output.to(x.dtype))
+        return logits
+
+    # -------------------------------------------------------------------
     # Weight loading
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
 
     def load_weights(
         self,
@@ -148,7 +224,8 @@ class DS4Model(nn.Module):
             parent, attr, kind = state_paths[mkey]
             tensor_desc = g.tensors[gname]
             arr = _dequant_tensor(g, tensor_desc)
-            t = torch.from_numpy(arr).reshape(tuple(tensor_desc.shape))
+            arr = _to_logical_layout(arr, tensor_desc.shape)
+            t = torch.from_numpy(arr)
             if kind == "int":
                 t = t.to(device=device, dtype=torch.int32)
             else:
@@ -160,17 +237,17 @@ class DS4Model(nn.Module):
             else:
                 setattr(parent, attr, t)
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # Name map: GGUF tensor name -> dotted model state_dict key
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
 
     def gguf_name_map(self) -> dict[str, str]:
         """Bidirectional-ready GGUF→model name map. Computed from cfg, deterministic."""
         return build_name_map(self.cfg)
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # Internal: enumerate every loadable leaf and its host module
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
 
     def _named_param_paths(self) -> dict[str, tuple[nn.Module, str, str]]:
         """Map dotted state_dict key → (parent_module, attr_name, kind).
@@ -181,6 +258,119 @@ class DS4Model(nn.Module):
         for path, parent, attr, kind in _walk_leaves(self):
             out[path] = (parent, attr, kind)
         return out
+
+
+# ---------------------------------------------------------------------------
+# Expert lazy loader (for M8e: keeps expert 3D tensors in GGUF mmap)
+# ---------------------------------------------------------------------------
+
+# Dequant block constants keyed by TensorType.
+_BLOCK_ELEMS = {8: 32, 10: 256, 16: 256}     # Q8_0, Q2_K, IQ2_XXS
+_BLOCK_BYTES = {8: 34, 10: 84, 16: 66}
+
+
+def _make_expert_loader(
+    g: gguf.GGUFFile,
+    prefix: str,
+    n_expert: int,
+    n_embd: int,
+    ff_exp: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    cache_size: int = 128,
+) -> Callable:
+    """Return `fn(expert_id, slot)` that loads (gate, up, down) for one expert.
+
+    Expert tensors are 3-D: gate=(n_embd, ff_exp, n_expert), same for up,
+    down=(ff_exp, n_embd, n_expert). Byte layout puts the expert axis outermost
+    so each expert's bytes are contiguous. We dequant directly from the GGUF
+    mmap without materializing the full tensor.
+
+    `cache` is a simple most-recently-used dict of size `cache_size`.
+    """
+    gate_t = g.tensors[f"{prefix}.ffn_gate_exps.weight"]
+    up_t = g.tensors[f"{prefix}.ffn_up_exps.weight"]
+    down_t = g.tensors[f"{prefix}.ffn_down_exps.weight"]
+
+    gate_dtype = gate_t.dtype
+    up_dtype = up_t.dtype
+    down_dtype = down_t.dtype
+
+    n_expert_t = gate_t.shape[-1] if len(gate_t.shape) == 3 else 1
+    if n_expert_t != n_expert:
+        raise ValueError(f"expected {n_expert} experts, got {n_expert_t}")
+
+    # Elements per expert = product of leading dims
+    gate_elts_per_exp = n_embd * ff_exp
+    up_elts_per_exp = n_embd * ff_exp
+    down_elts_per_exp = ff_exp * n_embd
+
+    # Bytes per expert
+    gate_blks = (gate_elts_per_exp + _BLOCK_ELEMS[gate_dtype] - 1) // _BLOCK_ELEMS[gate_dtype]
+    up_blks = (up_elts_per_exp + _BLOCK_ELEMS[up_dtype] - 1) // _BLOCK_ELEMS[up_dtype]
+    down_blks = (down_elts_per_exp + _BLOCK_ELEMS[down_dtype] - 1) // _BLOCK_ELEMS[down_dtype]
+    gate_bytes_per_exp = gate_blks * _BLOCK_BYTES[gate_dtype]
+    up_bytes_per_exp = up_blks * _BLOCK_BYTES[up_dtype]
+    down_bytes_per_exp = down_blks * _BLOCK_BYTES[down_dtype]
+
+    gate_name = f"{prefix}.ffn_gate_exps.weight"
+    up_name = f"{prefix}.ffn_up_exps.weight"
+    down_name = f"{prefix}.ffn_down_exps.weight"
+
+    _cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+    # Track insert order for FIFO eviction
+    _evict: list[int] = []
+
+    def load(expert_id: int):
+        nonlocal _evict
+
+        if expert_id in _cache:
+            return _cache[expert_id]
+
+        def _dequant_and_shape(buf, elts, qt, logical_shape):
+            if qt == 16:
+                arr = dequant_iq2_xxs(buf, elts)
+            elif qt == 10:
+                arr = dequant_q2_k(buf, elts)
+            else:
+                raise RuntimeError(f"unsupported dtype {qt}")
+            arr = _to_logical_layout(arr, logical_shape)
+            return torch.from_numpy(arr).to(device=device, dtype=dtype)
+
+        # Slice and dequant each expert
+        gate_full = g.tensor_bytes(gate_name)
+        goff = expert_id * gate_bytes_per_exp
+        gate_w = _dequant_and_shape(
+            gate_full[goff : goff + gate_bytes_per_exp],
+            gate_elts_per_exp, gate_dtype, (n_embd, ff_exp),
+        )
+        gate_full.release()
+
+        up_full = g.tensor_bytes(up_name)
+        uoff = expert_id * up_bytes_per_exp
+        up_w = _dequant_and_shape(
+            up_full[uoff : uoff + up_bytes_per_exp],
+            up_elts_per_exp, up_dtype, (n_embd, ff_exp),
+        )
+        up_full.release()
+
+        down_full = g.tensor_bytes(down_name)
+        doff = expert_id * down_bytes_per_exp
+        down_w = _dequant_and_shape(
+            down_full[doff : doff + down_bytes_per_exp],
+            down_elts_per_exp, down_dtype, (ff_exp, n_embd),
+        )
+        down_full.release()
+
+        # Evict oldest if cache full
+        while len(_evict) >= cache_size:
+            oldest = _evict.pop(0)
+            del _cache[oldest]
+        _cache[expert_id] = (gate_w, up_w, down_w)
+        _evict.append(expert_id)
+        return _cache[expert_id]
+
+    return load
 
 
 # ---------------------------------------------------------------------------
@@ -312,3 +502,18 @@ def _dequant_tensor(g: gguf.GGUFFile, t: gguf.Tensor) -> np.ndarray:
     if dt == int(gguf.TensorType.I32):
         return np.frombuffer(bytes(buf), dtype=np.int32, count=n).copy()
     raise NotImplementedError(f"dequant for dtype {dt} ({t.dtype_name()}) not implemented")
+
+
+def _to_logical_layout(arr: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+    """Convert GGUF innermost-first storage to a C-contiguous logical tensor.
+
+    GGUF dimension 0 is contiguous. The model exposes those dimensions in
+    logical order, while NumPy and PyTorch make the last dimension contiguous.
+    Reverse the storage shape, then reverse the axes so matmul sees the same
+    rows and columns as ds4.
+    """
+    if len(shape) <= 1:
+        return arr.reshape(shape)
+    storage_shape = tuple(reversed(shape))
+    axes = tuple(reversed(range(len(shape))))
+    return arr.reshape(storage_shape).transpose(axes).copy()
